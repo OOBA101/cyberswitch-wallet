@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  createWallet, importWallet, loadWallets, saveWallets,
+  createWallet, importWallet, loadWallets,
   loadActiveIndex, saveActiveIndex, addWallet, deleteWalletAtIndex, deleteWallet
 } from '../../utils/wallet.ts'
 import type { WalletData } from '../../utils/wallet.ts'
@@ -8,7 +8,7 @@ import { getUSDCBalance, sendUSDC, getTransactions } from '../../utils/arc'
 
 type Screen = 'loading' | 'welcome' | 'showPhrase' | 'import' | 'dashboard' |
   'send' | 'receive' | 'settings' | 'addWallet' | 'addShowPhrase' |
-  'addImport' | 'confirmDelete' | 'revealPhrase' | 'walletSwitcher'
+  'addImport' | 'confirmDelete' | 'revealPhrase' | 'walletSwitcher' | 'txDetail'
 
 const CyberSwitchLogo = ({ size = 40, opacity = 1 }: { size?: number; opacity?: number }) => {
   const arc = (startDeg: number, endDeg: number, R = 46, r = 20) => {
@@ -54,6 +54,7 @@ export default function Popup() {
   const [successMsg, setSuccessMsg] = useState('')
   const [phraseRevealed, setPhraseRevealed] = useState(false)
   const [balances, setBalances] = useState<Record<string, string>>({})
+  const [selectedTx, setSelectedTx] = useState<any>(null)
 
   const wallet = wallets[activeIndex] || null
 
@@ -65,7 +66,6 @@ export default function Popup() {
         setActiveIndex(safeIdx)
         setScreen('dashboard')
         refreshDashboard(ws[safeIdx].address)
-        // prefetch all balances
         ws.forEach(w => getUSDCBalance(w.address).then(b => setBalances(prev => ({ ...prev, [w.address]: b }))))
       } else {
         setScreen('welcome')
@@ -89,11 +89,21 @@ export default function Popup() {
     setTimeout(() => setSuccessMsg(''), 4000)
   }
 
-  // ── Welcome: create first wallet ──────────────────────────
+  const formatDate = (ts: string) => {
+    if (!ts) return '—'
+    return new Date(ts).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
+  const openExplorer = (hash: string) => {
+    window.open(`https://testnet.arcscan.app/tx/${hash}`, '_blank')
+  }
+
+  // ── Loading ───────────────────────────────────────────────
   if (screen === 'loading') return (
     <div style={s.page}><WatermarkBg /><div style={s.center}><p style={s.muted}>Loading...</p></div></div>
   )
 
+  // ── Welcome ───────────────────────────────────────────────
   if (screen === 'welcome') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -111,10 +121,7 @@ export default function Popup() {
         <button style={s.btnPrimary} onClick={() => {
           const w = createWallet('Wallet 1')
           setNewMnemonic(w.mnemonic)
-          addWallet(w).then(({ wallets: ws, index }) => {
-            setWallets(ws)
-            setActiveIndex(index)
-          })
+          addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
           setScreen('showPhrase')
         }}>Create New Wallet</button>
         <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('import') }}>Import Existing Wallet</button>
@@ -141,7 +148,7 @@ export default function Popup() {
     </div>
   )
 
-  // ── Import wallet ─────────────────────────────────────────
+  // ── Import ────────────────────────────────────────────────
   if (screen === 'import' || screen === 'addImport') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -158,21 +165,18 @@ export default function Popup() {
             const name = `Wallet ${wallets.length + 1}`
             const w = importWallet(importPhrase.trim(), name)
             addWallet(w).then(({ wallets: ws, index }) => {
-              setWallets(ws)
-              setActiveIndex(index)
+              setWallets(ws); setActiveIndex(index)
               refreshDashboard(w.address)
               setScreen('dashboard')
               showSuccess(`✓ ${name} imported successfully!`)
             })
-          } catch {
-            setError('Invalid recovery phrase. Please check and try again.')
-          }
+          } catch { setError('Invalid recovery phrase. Please check and try again.') }
         }}>Import Wallet</button>
       </div>
     </div>
   )
 
-  // ── Add wallet (from settings) ────────────────────────────
+  // ── Add wallet ────────────────────────────────────────────
   if (screen === 'addWallet') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -186,10 +190,7 @@ export default function Popup() {
           const name = `Wallet ${wallets.length + 1}`
           const w = createWallet(name)
           setNewMnemonic(w.mnemonic)
-          addWallet(w).then(({ wallets: ws, index }) => {
-            setWallets(ws)
-            setActiveIndex(index)
-          })
+          addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
           setScreen('addShowPhrase')
         }}>Create New Wallet</button>
         <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('addImport') }}>Import Existing Wallet</button>
@@ -227,10 +228,10 @@ export default function Popup() {
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {wallets.map((w, i) => (
-            <div key={i} style={{ ...s.settingsItem, borderColor: i === activeIndex ? 'rgba(26,58,255,0.5)' : undefined, background: i === activeIndex ? 'rgba(26,58,255,0.12)' : undefined }}
+            <div key={i}
+              style={{ ...s.settingsItem, borderColor: i === activeIndex ? 'rgba(26,58,255,0.5)' : undefined, background: i === activeIndex ? 'rgba(26,58,255,0.12)' : undefined }}
               onClick={() => {
-                setActiveIndex(i)
-                saveActiveIndex(i)
+                setActiveIndex(i); saveActiveIndex(i)
                 setBalance(balances[w.address] || '0.00')
                 refreshDashboard(w.address)
                 setScreen('dashboard')
@@ -333,6 +334,90 @@ export default function Popup() {
     </div>
   )
 
+  // ── Transaction Detail ────────────────────────────────────
+  if (screen === 'txDetail' && selectedTx) {
+    const isSent = selectedTx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
+    const amount = selectedTx.value ? (parseFloat(selectedTx.value) / 1e18).toFixed(6) : '0.000000'
+    const hash = selectedTx.hash || ''
+    const shortHash = hash ? `${hash.slice(0, 16)}...${hash.slice(-8)}` : '—'
+    const status = selectedTx.status === 'ok' ? 'Success' : selectedTx.status || 'Unknown'
+
+    return (
+      <div style={s.page}>
+        <WatermarkBg />
+        <div style={s.content}>
+          <div style={s.pageHeader}>
+            <button style={s.backBtn} onClick={() => setScreen('dashboard')}>←</button>
+            <h2 style={s.pageTitle}>Transaction</h2>
+          </div>
+
+          {/* Status badge */}
+          <div style={{ alignSelf: 'center' }}>
+            <div style={{ ...s.successBadge, background: status === 'Success' ? 'rgba(16,185,129,0.15)' : 'rgba(248,113,113,0.15)', color: status === 'Success' ? '#10b981' : '#f87171', border: `1px solid ${status === 'Success' ? 'rgba(16,185,129,0.3)' : 'rgba(248,113,113,0.3)'}` }}>
+              {status === 'Success' ? '✓' : '✕'} {status}
+            </div>
+          </div>
+
+          {/* Amount */}
+          <div style={{ ...s.balanceCard, padding: '20px' }}>
+            <p style={s.balanceLabel}>{isSent ? 'SENT' : 'RECEIVED'}</p>
+            <p style={{ ...s.balanceAmount, fontSize: 32, color: isSent ? '#f87171' : '#10b981' }}>
+              {isSent ? '-' : '+'}{amount}
+            </p>
+            <p style={s.balanceCurrency}>USDC</p>
+          </div>
+
+          {/* Details */}
+          <div style={s.txDetailCard}>
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Type</span>
+              <span style={{ ...s.txDetailValue, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '↑ Sent' : '↓ Received'}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>From</span>
+              <span style={s.txDetailValue}>{selectedTx.from?.hash?.slice(0, 10)}...{selectedTx.from?.hash?.slice(-6)}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>To</span>
+              <span style={s.txDetailValue}>{selectedTx.to?.hash?.slice(0, 10)}...{selectedTx.to?.hash?.slice(-6)}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Date</span>
+              <span style={s.txDetailValue}>{formatDate(selectedTx.timestamp)}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Gas Used</span>
+              <span style={s.txDetailValue}>{selectedTx.gas_used || '—'}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Block</span>
+              <span style={s.txDetailValue}>#{selectedTx.block || '—'}</span>
+            </div>
+          </div>
+
+          {/* Hash */}
+          <div style={s.txHashBox}>
+            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>TRANSACTION HASH</p>
+            <p style={{ margin: 0, fontSize: 11, color: '#93b4ff', wordBreak: 'break-all', lineHeight: 1.6 }}>{hash}</p>
+          </div>
+
+          {/* Actions */}
+          <button style={s.btnPrimary} onClick={() => openExplorer(hash)}>
+            View on Arc Explorer ↗
+          </button>
+          <button style={s.btnOutline} onClick={() => handleCopy(hash)}>
+            {copied ? '✓ Hash Copied!' : '⎘  Copy Hash'}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // ── Settings ──────────────────────────────────────────────
   if (screen === 'settings') return (
     <div style={s.page}>
@@ -417,19 +502,16 @@ export default function Popup() {
             {' '}Make sure you have your recovery phrase saved.
           </p>
         </div>
-        <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.4)' }}
+        <button
+          style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.4)' }}
           onClick={() => {
             deleteWalletAtIndex(activeIndex).then(({ wallets: ws, newIndex }) => {
               if (ws.length === 0) {
-                deleteWallet()
-                setWallets([])
-                setScreen('welcome')
+                deleteWallet(); setWallets([]); setScreen('welcome')
               } else {
-                setWallets(ws)
-                setActiveIndex(newIndex)
+                setWallets(ws); setActiveIndex(newIndex)
                 refreshDashboard(ws[newIndex].address)
-                setScreen('dashboard')
-                showSuccess(`✓ Wallet deleted`)
+                setScreen('dashboard'); showSuccess('✓ Wallet deleted')
               }
             })
           }}>
@@ -488,7 +570,8 @@ export default function Popup() {
                 const isSent = tx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
                 const amount = tx.value ? (parseFloat(tx.value) / 1e18).toFixed(2) : '0.00'
                 return (
-                  <div key={i} style={s.txItem}>
+                  <div key={i} style={{ ...s.txItem, cursor: 'pointer' }}
+                    onClick={() => { setSelectedTx(tx); setScreen('txDetail') }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ fontSize: 18, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '↑' : '↓'}</span>
                       <div>
@@ -498,9 +581,12 @@ export default function Popup() {
                         </p>
                       </div>
                     </div>
-                    <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: isSent ? '#f87171' : '#10b981' }}>
-                      {isSent ? '-' : '+'}{amount} USDC
-                    </p>
+                    <div style={{ textAlign: 'right' }}>
+                      <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: isSent ? '#f87171' : '#10b981' }}>
+                        {isSent ? '-' : '+'}{amount} USDC
+                      </p>
+                      <p style={{ margin: 0, fontSize: 10, color: '#4a5580' }}>tap for details</p>
+                    </div>
                   </div>
                 )
               })}
@@ -568,5 +654,11 @@ const s: Record<string, React.CSSProperties> = {
   txTitle: { fontSize: 13, fontWeight: 600, color: '#7b8cde', margin: 0, letterSpacing: 0.4, textTransform: 'uppercase' },
   txEmpty: { background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 12, padding: 20, textAlign: 'center', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   txItem: { background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  txDetailCard: { background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, padding: '4px 16px' },
+  txDetailRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0' },
+  txDetailLabel: { fontSize: 12, color: '#7b8cde' },
+  txDetailValue: { fontSize: 12, color: '#fff', fontWeight: 500, textAlign: 'right', maxWidth: '60%' },
+  txDetailDivider: { height: 1, background: 'rgba(255,255,255,0.05)' },
+  txHashBox: { background: 'rgba(26,58,255,0.08)', border: '1px solid rgba(26,58,255,0.2)', borderRadius: 10, padding: '12px 14px' },
   error: { color: '#f87171', fontSize: 12, margin: 0 },
 }
