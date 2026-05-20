@@ -339,7 +339,6 @@ export default function Popup() {
     const isSent = selectedTx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
     const amount = selectedTx.value ? (parseFloat(selectedTx.value) / 1e18).toFixed(6) : '0.000000'
     const hash = selectedTx.hash || ''
-    const shortHash = hash ? `${hash.slice(0, 16)}...${hash.slice(-8)}` : '—'
     const status = selectedTx.status === 'ok' ? 'Success' : selectedTx.status || 'Unknown'
 
     return (
@@ -599,8 +598,8 @@ export default function Popup() {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  page: { width: 380, minHeight: 560, background: 'linear-gradient(160deg, #04041e 0%, #060d3a 60%, #04041e 100%)', color: '#fff', fontFamily: "'Inter', sans-serif", position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' },
-  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 14, padding: 24, flex: 1 },
+  page: { width: 380, height: 600, background: 'linear-gradient(160deg, #04041e 0%, #060d3a 60%, #04041e 100%)', color: '#fff', fontFamily: "'Inter', sans-serif", position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' },
+  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 14, padding: 24, flex: 1, overflowY: 'auto', maxHeight: '580px' },
   center: { display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1 },
   logoRow: { display: 'flex', alignItems: 'center', gap: 12 },
   brandName: { fontSize: 17, fontWeight: 700, margin: 0, letterSpacing: 0.3 },

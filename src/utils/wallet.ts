@@ -10,21 +10,38 @@ export interface WalletData {
   name: string
 }
 
-const isChrome = typeof chrome !== 'undefined' && !!chrome.storage
+const isChromeExtension = (): boolean => {
+  try {
+    return typeof (globalThis as any).chrome !== 'undefined' &&
+      !!(globalThis as any).chrome?.storage?.local
+  } catch {
+    return false
+  }
+}
+
+const chromeStorage = () => (globalThis as any).chrome?.storage?.local
 
 const store = {
   get: (key: string): Promise<any> => {
-    if (isChrome) return new Promise(r => chrome.storage.local.get([key], res => r(res[key])))
+    if (isChromeExtension()) {
+      return new Promise(r => chromeStorage().get([key], (res: any) => r(res[key])))
+    }
     const d = localStorage.getItem(key)
     return Promise.resolve(d ? JSON.parse(d) : null)
   },
   set: (key: string, value: any): void => {
-    if (isChrome) chrome.storage.local.set({ [key]: value })
-    else localStorage.setItem(key, JSON.stringify(value))
+    if (isChromeExtension()) {
+      chromeStorage().set({ [key]: value })
+    } else {
+      localStorage.setItem(key, JSON.stringify(value))
+    }
   },
   remove: (key: string): void => {
-    if (isChrome) chrome.storage.local.remove([key])
-    else localStorage.removeItem(key)
+    if (isChromeExtension()) {
+      chromeStorage().remove([key])
+    } else {
+      localStorage.removeItem(key)
+    }
   }
 }
 
@@ -39,13 +56,13 @@ export const importWallet = (mnemonic: string, name: string): WalletData => {
 }
 
 export const loadWallets = (): Promise<WalletData[]> =>
-  store.get(WALLETS_KEY).then(d => d || [])
+  store.get(WALLETS_KEY).then((d: any) => d || [])
 
 export const saveWallets = (wallets: WalletData[]): void =>
   store.set(WALLETS_KEY, wallets)
 
 export const loadActiveIndex = (): Promise<number> =>
-  store.get(ACTIVE_KEY).then(d => d ?? 0)
+  store.get(ACTIVE_KEY).then((d: any) => d ?? 0)
 
 export const saveActiveIndex = (index: number): void =>
   store.set(ACTIVE_KEY, index)

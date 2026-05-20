@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "CyberSwitch Wallet",
+  "version": "1.0.0",
+  "description": "CyberSwitch Web3 Wallet — Send and receive USDC on Arc network",
+  "action": {
+    "default_popup": "index.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://rpc.testnet.arc.network/*",
+    "https://testnet.arcscan.app/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
