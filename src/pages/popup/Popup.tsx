@@ -1,14 +1,19 @@
 import { useState, useEffect } from 'react'
+import QRCode from 'qrcode'
 import {
   createWallet, importWallet, loadWallets,
-  loadActiveIndex, saveActiveIndex, addWallet, deleteWalletAtIndex, deleteWallet
+  loadActiveIndex, saveActiveIndex, addWallet,
+  deleteWalletAtIndex, deleteWallet,
+  setPassword, verifyPassword, hasPassword, removePassword
 } from '../../utils/wallet.ts'
 import type { WalletData } from '../../utils/wallet.ts'
 import { getUSDCBalance, sendUSDC, getTransactions } from '../../utils/arc'
 
-type Screen = 'loading' | 'welcome' | 'showPhrase' | 'import' | 'dashboard' |
-  'send' | 'receive' | 'settings' | 'addWallet' | 'addShowPhrase' |
-  'addImport' | 'confirmDelete' | 'revealPhrase' | 'walletSwitcher' | 'txDetail'
+type Screen = 'loading' | 'locked' | 'setPassword' | 'welcome' | 'showPhrase' |
+  'import' | 'dashboard' | 'send' | 'receive' | 'settings' | 'addWallet' |
+  'addShowPhrase' | 'addImport' | 'confirmDelete' | 'revealPhrase' |
+  'walletSwitcher' | 'txDetail' | 'approveConnect' | 'approveTx' |
+  'approveSign' | 'changePassword' | 'connectedSites'
 
 const CyberSwitchLogo = ({ size = 40, opacity = 1 }: { size?: number; opacity?: number }) => {
   const arc = (startDeg: number, endDeg: number, R = 46, r = 20) => {
@@ -55,27 +60,86 @@ export default function Popup() {
   const [phraseRevealed, setPhraseRevealed] = useState(false)
   const [balances, setBalances] = useState<Record<string, string>>({})
   const [selectedTx, setSelectedTx] = useState<any>(null)
+  const [pendingRequest, setPendingRequest] = useState<any>(null)
+  const [qrDataUrl, setQrDataUrl] = useState('')
+  const [passwordInput, setPasswordInput] = useState('')
+  const [passwordConfirm, setPasswordConfirm] = useState('')
+  const [connectedSites, setConnectedSites] = useState<string[]>([])
+  const [signatureResult, setSignatureResult] = useState('')
 
   const wallet = wallets[activeIndex] || null
 
+  // ── Init ──────────────────────────────────────
   useEffect(() => {
-    Promise.all([loadWallets(), loadActiveIndex()]).then(([ws, idx]) => {
-      if (ws.length > 0) {
-        setWallets(ws)
-        const safeIdx = Math.min(idx, ws.length - 1)
-        setActiveIndex(safeIdx)
-        setScreen('dashboard')
-        refreshDashboard(ws[safeIdx].address)
-        ws.forEach(w => getUSDCBalance(w.address).then(b => setBalances(prev => ({ ...prev, [w.address]: b }))))
-      } else {
+    const init = async () => {
+      const [ws, idx, hasPwd] = await Promise.all([
+        loadWallets(),
+        loadActiveIndex(),
+        hasPassword(),
+      ])
+      if (ws.length === 0) {
         setScreen('welcome')
+        return
       }
-    })
+      setWallets(ws)
+      const safeIdx = Math.min(idx, ws.length - 1)
+      setActiveIndex(safeIdx)
+      ws.forEach(w => getUSDCBalance(w.address).then(b =>
+        setBalances(prev => ({ ...prev, [w.address]: b }))
+      ))
+      if (hasPwd) {
+        setScreen('locked')
+      } else {
+        refreshDashboard(ws[safeIdx].address)
+      }
+    }
+    init()
+  }, [])
+
+  // ── Check pending approvals ───────────────────
+  useEffect(() => {
+    const check = () => {
+      const ch = (globalThis as any).chrome
+      if (!ch?.storage?.local) return
+      ch.storage.local.get(['cs_pending'], (res: any) => {
+        const pending = res['cs_pending']
+        if (pending && Date.now() - pending.ts < 120000) {
+          setPendingRequest(pending)
+          if (pending.type === 'connect') setScreen('approveConnect')
+          if (pending.type === 'transaction') setScreen('approveTx')
+          if (pending.type === 'sign') setScreen('approveSign')
+        }
+      })
+    }
+    check()
+    let attempts = 0
+    const interval = setInterval(() => {
+      attempts++
+      check()
+      if (attempts >= 20) clearInterval(interval)
+    }, 500)
+    const ch = (globalThis as any).chrome
+    if (ch?.storage?.onChanged) {
+      const listener = (changes: any) => {
+        if (changes['cs_pending']?.newValue) {
+          const pending = changes['cs_pending'].newValue
+          setPendingRequest(pending)
+          if (pending.type === 'connect') setScreen('approveConnect')
+          if (pending.type === 'transaction') setScreen('approveTx')
+          if (pending.type === 'sign') setScreen('approveSign')
+          clearInterval(interval)
+        }
+      }
+      ch.storage.onChanged.addListener(listener)
+      return () => { clearInterval(interval); ch.storage.onChanged.removeListener(listener) }
+    }
+    return () => clearInterval(interval)
   }, [])
 
   const refreshDashboard = (address: string) => {
     getUSDCBalance(address).then(b => { setBalance(b); setBalances(prev => ({ ...prev, [address]: b })) })
     getTransactions(address).then(setTransactions)
+    setScreen('dashboard')
   }
 
   const handleCopy = (text: string) => {
@@ -89,21 +153,211 @@ export default function Popup() {
     setTimeout(() => setSuccessMsg(''), 4000)
   }
 
+  const sendApprovalResponse = async (approved: boolean, result?: any) => {
+  if (!pendingRequest) return
+  const ch = (globalThis as any).chrome
+  if (!ch?.storage?.local) return
+
+  const requestId = pendingRequest.requestId
+  const origin = pendingRequest.data?.origin
+
+  try {
+    if (approved && requestId.startsWith('connect_') && origin) {
+      // Add to connected sites directly from popup
+      await new Promise<void>(r => {
+        ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+          const sites = res['cyberswitch_connected_sites'] || []
+          if (!sites.includes(origin)) {
+            ch.storage.local.set({ cyberswitch_connected_sites: [...sites, origin] }, r)
+          } else { r() }
+        })
+      })
+
+      // Get active wallet directly
+      await new Promise<void>(r => {
+        ch.storage.local.get(['cyberswitch_wallets', 'cyberswitch_active'], (res: any) => {
+          const ws = res['cyberswitch_wallets'] || []
+          const idx = Math.min(res['cyberswitch_active'] ?? 0, ws.length - 1)
+          const w = ws[idx]
+          const addresses = w ? [w.address] : []
+          ch.storage.local.set({
+            [`cs_resp_${requestId}`]: { result: addresses, error: null, ts: Date.now() }
+          }, r)
+        })
+      })
+
+    } else if (approved && requestId.startsWith('tx_')) {
+      await new Promise<void>(r => {
+        ch.storage.local.set({
+          [`cs_resp_${requestId}`]: { result: result ?? null, error: null, ts: Date.now() }
+        }, r)
+      })
+
+    } else if (approved && requestId.startsWith('sign_')) {
+      await new Promise<void>(r => {
+        ch.storage.local.set({
+          [`cs_resp_${requestId}`]: { result: result ?? null, error: null, ts: Date.now() }
+        }, r)
+      })
+
+    } else {
+      // Rejected
+      await new Promise<void>(r => {
+        ch.storage.local.set({
+          [`cs_resp_${requestId}`]: {
+            result: null,
+            error: { code: 4001, message: 'User rejected the request' },
+            ts: Date.now()
+          }
+        }, r)
+      })
+    }
+
+    // Clean up pending
+    await new Promise<void>(r => ch.storage.local.remove(['cs_pending'], r))
+
+  } catch (e) {
+    console.error('sendApprovalResponse error:', e)
+  }
+
+  setPendingRequest(null)
+  setScreen('dashboard')
+}
+
+  const generateQR = async (address: string) => {
+    try {
+      const url = await QRCode.toDataURL(address, { width: 200, margin: 2, color: { dark: '#ffffff', light: '#0d1b6e' } })
+      setQrDataUrl(url)
+    } catch {}
+  }
+
   const formatDate = (ts: string) => {
     if (!ts) return '—'
     return new Date(ts).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
   }
 
-  const openExplorer = (hash: string) => {
-    window.open(`https://testnet.arcscan.app/tx/${hash}`, '_blank')
+  const openExplorer = (hash: string) => window.open(`https://testnet.arcscan.app/tx/${hash}`, '_blank')
+
+  const loadConnectedSites = () => {
+    const ch = (globalThis as any).chrome
+    if (ch?.storage?.local) {
+      ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+        setConnectedSites(res['cyberswitch_connected_sites'] || [])
+      })
+    }
   }
 
-  // ── Loading ───────────────────────────────────────────────
-  if (screen === 'loading') return (
-    <div style={s.page}><WatermarkBg /><div style={s.center}><p style={s.muted}>Loading...</p></div></div>
+  const disconnectSite = (origin: string) => {
+    const ch = (globalThis as any).chrome
+    if (ch?.storage?.local) {
+      ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+        const sites = (res['cyberswitch_connected_sites'] || []).filter((s: string) => s !== origin)
+        ch.storage.local.set({ cyberswitch_connected_sites: sites }, () => setConnectedSites(sites))
+      })
+    }
+  }
+
+  // ── Lock screen ───────────────────────────────
+  if (screen === 'locked') return (
+    <div style={s.page}>
+      <WatermarkBg />
+      <div style={s.content}>
+        <div style={{ ...s.logoRow, justifyContent: 'center', marginTop: 40 }}>
+          <CyberSwitchLogo size={64} />
+        </div>
+        <h1 style={{ ...s.heroTitle, textAlign: 'center' }}>CyberSwitch</h1>
+        <p style={{ ...s.bodyText, textAlign: 'center' }}>Enter your password to unlock</p>
+        <div style={s.inputGroup}>
+          <label style={s.label}>Password</label>
+          <input style={s.input} type="password" placeholder="Enter password"
+            value={passwordInput} onChange={e => setPasswordInput(e.target.value)}
+            onKeyDown={async e => {
+              if (e.key === 'Enter') {
+                const ok = await verifyPassword(passwordInput)
+                if (ok) { setPasswordInput(''); setError(''); refreshDashboard(wallets[activeIndex].address) }
+                else setError('Incorrect password')
+              }
+            }} />
+        </div>
+        {error && <p style={s.error}>{error}</p>}
+        <button style={s.btnPrimary} onClick={async () => {
+          const ok = await verifyPassword(passwordInput)
+          if (ok) { setPasswordInput(''); setError(''); refreshDashboard(wallets[activeIndex].address) }
+          else setError('Incorrect password')
+        }}>Unlock</button>
+      </div>
+    </div>
   )
 
-  // ── Welcome ───────────────────────────────────────────────
+  // ── Set password (first time) ─────────────────
+  if (screen === 'setPassword') return (
+    <div style={s.page}>
+      <WatermarkBg />
+      <div style={s.content}>
+        <div style={s.pageHeader}>
+          <button style={s.backBtn} onClick={() => setScreen('dashboard')}>←</button>
+          <h2 style={s.pageTitle}>Set Password</h2>
+        </div>
+        <p style={s.bodyText}>Create a password to protect your wallet. You'll need this every time you open CyberSwitch.</p>
+        <div style={s.inputGroup}>
+          <label style={s.label}>New Password</label>
+          <input style={s.input} type="password" placeholder="Min 6 characters"
+            value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
+        </div>
+        <div style={s.inputGroup}>
+          <label style={s.label}>Confirm Password</label>
+          <input style={s.input} type="password" placeholder="Repeat password"
+            value={passwordConfirm} onChange={e => setPasswordConfirm(e.target.value)} />
+        </div>
+        {error && <p style={s.error}>{error}</p>}
+        <button style={s.btnPrimary} onClick={async () => {
+          if (passwordInput.length < 6) { setError('Password must be at least 6 characters'); return }
+          if (passwordInput !== passwordConfirm) { setError('Passwords do not match'); return }
+          await setPassword(passwordInput)
+          setPasswordInput(''); setPasswordConfirm(''); setError('')
+          showSuccess('✓ Password set successfully!')
+          setScreen('settings')
+        }}>Set Password</button>
+        <button style={s.btnGhost} onClick={() => { setPasswordInput(''); setPasswordConfirm(''); setScreen('settings') }}>← Cancel</button>
+      </div>
+    </div>
+  )
+
+  // ── Change password ───────────────────────────
+  if (screen === 'changePassword') return (
+    <div style={s.page}>
+      <WatermarkBg />
+      <div style={s.content}>
+        <div style={s.pageHeader}>
+          <button style={s.backBtn} onClick={() => setScreen('settings')}>←</button>
+          <h2 style={s.pageTitle}>Change Password</h2>
+        </div>
+        <div style={s.inputGroup}>
+          <label style={s.label}>Current Password</label>
+          <input style={s.input} type="password" placeholder="Current password"
+            value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
+        </div>
+        <div style={s.inputGroup}>
+          <label style={s.label}>New Password</label>
+          <input style={s.input} type="password" placeholder="Min 6 characters"
+            value={passwordConfirm} onChange={e => setPasswordConfirm(e.target.value)} />
+        </div>
+        {error && <p style={s.error}>{error}</p>}
+        <button style={s.btnPrimary} onClick={async () => {
+          const ok = await verifyPassword(passwordInput)
+          if (!ok) { setError('Current password is incorrect'); return }
+          if (passwordConfirm.length < 6) { setError('New password too short'); return }
+          await setPassword(passwordConfirm)
+          setPasswordInput(''); setPasswordConfirm(''); setError('')
+          showSuccess('✓ Password changed!')
+          setScreen('settings')
+        }}>Change Password</button>
+        <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Cancel</button>
+      </div>
+    </div>
+  )
+
+  // ── Welcome ───────────────────────────────────
   if (screen === 'welcome') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -124,13 +378,15 @@ export default function Popup() {
           addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
           setScreen('showPhrase')
         }}>Create New Wallet</button>
-        <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('import') }}>Import Existing Wallet</button>
+        <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('import') }}>
+          Import Existing Wallet
+        </button>
       </div>
     </div>
   )
 
-  // ── Show seed phrase after creating ──────────────────────
-  if (screen === 'showPhrase') return (
+  // ── Show phrase ───────────────────────────────
+  if (screen === 'showPhrase' || screen === 'addShowPhrase') return (
     <div style={s.page}>
       <WatermarkBg />
       <div style={s.content}>
@@ -139,16 +395,23 @@ export default function Popup() {
         <p style={s.bodyText}>Write this down and store it safely. It's the only way to recover your wallet.</p>
         <div style={s.mnemonicBox}>{newMnemonic}</div>
         <button style={s.btnOutline} onClick={() => handleCopy(newMnemonic)}>{copied ? '✓ Copied!' : '⎘  Copy Phrase'}</button>
-        <button style={s.btnPrimary} onClick={() => {
+        <button style={s.btnPrimary} onClick={async () => {
+          const hasPwd = await hasPassword()
           const w = wallets[activeIndex]
-          if (w) refreshDashboard(w.address)
-          setScreen('dashboard')
+          if (w) {
+            if (!hasPwd) {
+              refreshDashboard(w.address)
+              showSuccess('💡 Set a password in Settings to secure your wallet')
+            } else {
+              refreshDashboard(w.address)
+            }
+          } else setScreen('dashboard')
         }}>I've saved it safely →</button>
       </div>
     </div>
   )
 
-  // ── Import ────────────────────────────────────────────────
+  // ── Import ────────────────────────────────────
   if (screen === 'import' || screen === 'addImport') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -158,7 +421,8 @@ export default function Popup() {
           <h2 style={s.pageTitle}>Import Wallet</h2>
         </div>
         <p style={s.bodyText}>Enter your 12 or 24-word recovery phrase</p>
-        <textarea style={s.textarea} placeholder="word1 word2 word3 ..." value={importPhrase} onChange={(e) => setImportPhrase(e.target.value)} />
+        <textarea style={s.textarea} placeholder="word1 word2 word3 ..."
+          value={importPhrase} onChange={e => setImportPhrase(e.target.value)} />
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={() => {
           try {
@@ -167,16 +431,15 @@ export default function Popup() {
             addWallet(w).then(({ wallets: ws, index }) => {
               setWallets(ws); setActiveIndex(index)
               refreshDashboard(w.address)
-              setScreen('dashboard')
-              showSuccess(`✓ ${name} imported successfully!`)
+              showSuccess(`✓ ${name} imported!`)
             })
-          } catch { setError('Invalid recovery phrase. Please check and try again.') }
+          } catch { setError('Invalid recovery phrase.') }
         }}>Import Wallet</button>
       </div>
     </div>
   )
 
-  // ── Add wallet ────────────────────────────────────────────
+  // ── Add wallet ────────────────────────────────
   if (screen === 'addWallet') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -193,31 +456,14 @@ export default function Popup() {
           addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
           setScreen('addShowPhrase')
         }}>Create New Wallet</button>
-        <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('addImport') }}>Import Existing Wallet</button>
+        <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('addImport') }}>
+          Import Existing Wallet
+        </button>
       </div>
     </div>
   )
 
-  if (screen === 'addShowPhrase') return (
-    <div style={s.page}>
-      <WatermarkBg />
-      <div style={s.content}>
-        <div style={s.successBadge}>✓ Wallet Created</div>
-        <h2 style={s.sectionTitle}>Save Your Recovery Phrase</h2>
-        <p style={s.bodyText}>Write this down and store it safely.</p>
-        <div style={s.mnemonicBox}>{newMnemonic}</div>
-        <button style={s.btnOutline} onClick={() => handleCopy(newMnemonic)}>{copied ? '✓ Copied!' : '⎘  Copy Phrase'}</button>
-        <button style={s.btnPrimary} onClick={() => {
-          const w = wallets[activeIndex]
-          if (w) refreshDashboard(w.address)
-          setScreen('dashboard')
-          showSuccess(`✓ ${wallets[activeIndex]?.name} created!`)
-        }}>I've saved it safely →</button>
-      </div>
-    </div>
-  )
-
-  // ── Wallet Switcher ───────────────────────────────────────
+  // ── Wallet switcher ───────────────────────────
   if (screen === 'walletSwitcher') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -230,12 +476,7 @@ export default function Popup() {
           {wallets.map((w, i) => (
             <div key={i}
               style={{ ...s.settingsItem, borderColor: i === activeIndex ? 'rgba(26,58,255,0.5)' : undefined, background: i === activeIndex ? 'rgba(26,58,255,0.12)' : undefined }}
-              onClick={() => {
-                setActiveIndex(i); saveActiveIndex(i)
-                setBalance(balances[w.address] || '0.00')
-                refreshDashboard(w.address)
-                setScreen('dashboard')
-              }}>
+              onClick={() => { setActiveIndex(i); saveActiveIndex(i); setBalance(balances[w.address] || '0.00'); refreshDashboard(w.address) }}>
               <div>
                 <p style={s.settingsTitle}>{w.name} {i === activeIndex ? '✓' : ''}</p>
                 <p style={s.settingsSub}>{w.address.slice(0, 10)}...{w.address.slice(-6)}</p>
@@ -250,7 +491,7 @@ export default function Popup() {
     </div>
   )
 
-  // ── Receive ───────────────────────────────────────────────
+  // ── Receive ───────────────────────────────────
   if (screen === 'receive') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -261,18 +502,29 @@ export default function Popup() {
         </div>
         <p style={s.bodyText}>Share your Arc wallet address to receive USDC</p>
         <div style={s.qrPlaceholder}>
-          <div style={s.qrInner}>
-            <CyberSwitchLogo size={48} />
-            <p style={{ ...s.muted, fontSize: 11, marginTop: 8 }}>QR Coming Soon</p>
-          </div>
+          {qrDataUrl ? (
+            <img src={qrDataUrl} alt="QR Code" style={{ width: 180, height: 180, borderRadius: 8 }} />
+          ) : (
+            <div style={s.qrInner}>
+              <CyberSwitchLogo size={48} />
+              <p style={{ ...s.muted, fontSize: 11, marginTop: 8 }}>Tap to generate QR</p>
+            </div>
+          )}
         </div>
+        {!qrDataUrl && (
+          <button style={s.btnSecondary} onClick={() => wallet && generateQR(wallet.address)}>
+            Generate QR Code
+          </button>
+        )}
         <div style={s.addressBox}>{wallet?.address}</div>
-        <button style={s.btnPrimary} onClick={() => handleCopy(wallet?.address || '')}>{copied ? '✓ Copied!' : '⎘  Copy Address'}</button>
+        <button style={s.btnPrimary} onClick={() => handleCopy(wallet?.address || '')}>
+          {copied ? '✓ Copied!' : '⎘  Copy Address'}
+        </button>
       </div>
     </div>
   )
 
-  // ── Send ──────────────────────────────────────────────────
+  // ── Send ──────────────────────────────────────
   if (screen === 'send') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -285,19 +537,16 @@ export default function Popup() {
           <>
             <div style={s.inputGroup}>
               <label style={s.label}>Recipient Address</label>
-              <input style={s.input} placeholder="0x..." value={sendAddress} onChange={(e) => setSendAddress(e.target.value)} />
+              <input style={s.input} placeholder="0x..." value={sendAddress} onChange={e => setSendAddress(e.target.value)} />
             </div>
             <div style={s.inputGroup}>
               <label style={s.label}>Amount</label>
               <div style={s.amountRow}>
-                <input style={{ ...s.input, flex: 1 }} placeholder="0.00" type="number" value={sendAmount} onChange={(e) => setSendAmount(e.target.value)} />
+                <input style={{ ...s.input, flex: 1 }} placeholder="0.00" type="number" value={sendAmount} onChange={e => setSendAmount(e.target.value)} />
                 <span style={s.tokenBadge}>USDC</span>
               </div>
             </div>
-            <div style={s.networkRow}>
-              <span style={s.dot} />
-              <span style={s.networkLabel}>Arc Testnet · Balance: {balance} USDC</span>
-            </div>
+            <div style={s.networkRow}><span style={s.dot} /><span style={s.networkLabel}>Arc Testnet · Balance: {balance} USDC</span></div>
             {error && <p style={s.error}>{error}</p>}
             <button style={s.btnPrimary} onClick={() => {
               if (!sendAddress || !sendAmount) { setError('Please fill in all fields'); return }
@@ -320,12 +569,9 @@ export default function Popup() {
               const result = await sendUSDC(wallet!.privateKey, sendAddress, sendAmount)
               if (result.success) {
                 setSendAddress(''); setSendAmount(''); setConfirming(false)
-                setScreen('dashboard')
                 refreshDashboard(wallet!.address)
-                showSuccess(`✓ ${amt} USDC sent successfully!`)
-              } else {
-                setError(result.error || 'Transaction failed'); setConfirming(false)
-              }
+                showSuccess(`✓ ${amt} USDC sent!`)
+              } else { setError(result.error || 'Transaction failed'); setConfirming(false) }
             }}>Confirm & Send</button>
             <button style={s.btnGhost} onClick={() => setConfirming(false)}>← Cancel</button>
           </>
@@ -334,13 +580,12 @@ export default function Popup() {
     </div>
   )
 
-  // ── Transaction Detail ────────────────────────────────────
+  // ── Transaction Detail ────────────────────────
   if (screen === 'txDetail' && selectedTx) {
     const isSent = selectedTx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
     const amount = selectedTx.value ? (parseFloat(selectedTx.value) / 1e18).toFixed(6) : '0.000000'
     const hash = selectedTx.hash || ''
     const status = selectedTx.status === 'ok' ? 'Success' : selectedTx.status || 'Unknown'
-
     return (
       <div style={s.page}>
         <WatermarkBg />
@@ -349,75 +594,46 @@ export default function Popup() {
             <button style={s.backBtn} onClick={() => setScreen('dashboard')}>←</button>
             <h2 style={s.pageTitle}>Transaction</h2>
           </div>
-
-          {/* Status badge */}
           <div style={{ alignSelf: 'center' }}>
             <div style={{ ...s.successBadge, background: status === 'Success' ? 'rgba(16,185,129,0.15)' : 'rgba(248,113,113,0.15)', color: status === 'Success' ? '#10b981' : '#f87171', border: `1px solid ${status === 'Success' ? 'rgba(16,185,129,0.3)' : 'rgba(248,113,113,0.3)'}` }}>
               {status === 'Success' ? '✓' : '✕'} {status}
             </div>
           </div>
-
-          {/* Amount */}
           <div style={{ ...s.balanceCard, padding: '20px' }}>
             <p style={s.balanceLabel}>{isSent ? 'SENT' : 'RECEIVED'}</p>
-            <p style={{ ...s.balanceAmount, fontSize: 32, color: isSent ? '#f87171' : '#10b981' }}>
-              {isSent ? '-' : '+'}{amount}
-            </p>
+            <p style={{ ...s.balanceAmount, fontSize: 32, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '-' : '+'}{amount}</p>
             <p style={s.balanceCurrency}>USDC</p>
           </div>
-
-          {/* Details */}
           <div style={s.txDetailCard}>
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Type</span>
-              <span style={{ ...s.txDetailValue, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '↑ Sent' : '↓ Received'}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>From</span>
-              <span style={s.txDetailValue}>{selectedTx.from?.hash?.slice(0, 10)}...{selectedTx.from?.hash?.slice(-6)}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>To</span>
-              <span style={s.txDetailValue}>{selectedTx.to?.hash?.slice(0, 10)}...{selectedTx.to?.hash?.slice(-6)}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Date</span>
-              <span style={s.txDetailValue}>{formatDate(selectedTx.timestamp)}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Gas Used</span>
-              <span style={s.txDetailValue}>{selectedTx.gas_used || '—'}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Block</span>
-              <span style={s.txDetailValue}>#{selectedTx.block || '—'}</span>
-            </div>
+            {[
+              ['Type', isSent ? '↑ Sent' : '↓ Received', isSent ? '#f87171' : '#10b981'],
+              ['From', `${selectedTx.from?.hash?.slice(0, 10)}...${selectedTx.from?.hash?.slice(-6)}`, '#fff'],
+              ['To', `${selectedTx.to?.hash?.slice(0, 10)}...${selectedTx.to?.hash?.slice(-6)}`, '#fff'],
+              ['Date', formatDate(selectedTx.timestamp), '#fff'],
+              ['Gas Used', selectedTx.gas_used || '—', '#fff'],
+              ['Block', `#${selectedTx.block || '—'}`, '#fff'],
+            ].map(([label, value, color], i) => (
+              <div key={i}>
+                {i > 0 && <div style={s.txDetailDivider} />}
+                <div style={s.txDetailRow}>
+                  <span style={s.txDetailLabel}>{label}</span>
+                  <span style={{ ...s.txDetailValue, color: color as string }}>{value}</span>
+                </div>
+              </div>
+            ))}
           </div>
-
-          {/* Hash */}
           <div style={s.txHashBox}>
             <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>TRANSACTION HASH</p>
             <p style={{ margin: 0, fontSize: 11, color: '#93b4ff', wordBreak: 'break-all', lineHeight: 1.6 }}>{hash}</p>
           </div>
-
-          {/* Actions */}
-          <button style={s.btnPrimary} onClick={() => openExplorer(hash)}>
-            View on Arc Explorer ↗
-          </button>
-          <button style={s.btnOutline} onClick={() => handleCopy(hash)}>
-            {copied ? '✓ Hash Copied!' : '⎘  Copy Hash'}
-          </button>
+          <button style={s.btnPrimary} onClick={() => openExplorer(hash)}>View on Arc Explorer ↗</button>
+          <button style={s.btnOutline} onClick={() => handleCopy(hash)}>{copied ? '✓ Hash Copied!' : '⎘  Copy Hash'}</button>
         </div>
       </div>
     )
   }
 
-  // ── Settings ──────────────────────────────────────────────
+  // ── Settings ──────────────────────────────────
   if (screen === 'settings') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -427,31 +643,70 @@ export default function Popup() {
           <h2 style={s.pageTitle}>Settings</h2>
         </div>
         <div style={s.settingsItem} onClick={() => setScreen('addWallet')}>
-          <div>
-            <p style={s.settingsTitle}>Add Wallet</p>
-            <p style={s.settingsSub}>Create or import another wallet</p>
-          </div>
+          <div><p style={s.settingsTitle}>Add Wallet</p><p style={s.settingsSub}>Create or import another wallet</p></div>
           <span style={s.settingsArrow}>→</span>
         </div>
         <div style={s.settingsItem} onClick={() => { setPhraseRevealed(false); setScreen('revealPhrase') }}>
-          <div>
-            <p style={s.settingsTitle}>Reveal Recovery Phrase</p>
-            <p style={s.settingsSub}>View seed phrase for {wallet?.name}</p>
-          </div>
+          <div><p style={s.settingsTitle}>Reveal Recovery Phrase</p><p style={s.settingsSub}>View seed phrase for {wallet?.name}</p></div>
+          <span style={s.settingsArrow}>→</span>
+        </div>
+        <div style={s.settingsItem} onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
+          <div><p style={s.settingsTitle}>Connected Sites</p><p style={s.settingsSub}>Manage dApp connections</p></div>
+          <span style={s.settingsArrow}>→</span>
+        </div>
+        <div style={s.settingsItem} onClick={async () => {
+          const hasPwd = await hasPassword()
+          setPasswordInput(''); setPasswordConfirm(''); setError('')
+          setScreen(hasPwd ? 'changePassword' : 'setPassword')
+        }}>
+          <div><p style={s.settingsTitle}>Password</p><p style={s.settingsSub}>Set or change your wallet password</p></div>
+          <span style={s.settingsArrow}>→</span>
+        </div>
+        <div style={s.settingsItem} onClick={async () => {
+          const hasPwd = await hasPassword()
+          if (hasPwd) { removePassword(); showSuccess('✓ Password removed') }
+          else showSuccess('No password set')
+        }}>
+          <div><p style={s.settingsTitle}>Remove Password</p><p style={s.settingsSub}>Disable password protection</p></div>
           <span style={s.settingsArrow}>→</span>
         </div>
         <div style={{ ...s.settingsItem, borderColor: 'rgba(248,113,113,0.2)' }} onClick={() => setScreen('confirmDelete')}>
-          <div>
-            <p style={{ ...s.settingsTitle, color: '#f87171' }}>Delete {wallet?.name}</p>
-            <p style={s.settingsSub}>Remove this wallet from device</p>
-          </div>
+          <div><p style={{ ...s.settingsTitle, color: '#f87171' }}>Delete {wallet?.name}</p><p style={s.settingsSub}>Remove this wallet from device</p></div>
           <span style={{ ...s.settingsArrow, color: '#f87171' }}>→</span>
         </div>
       </div>
     </div>
   )
 
-  // ── Reveal phrase ─────────────────────────────────────────
+  // ── Connected sites ───────────────────────────
+  if (screen === 'connectedSites') return (
+    <div style={s.page}>
+      <WatermarkBg />
+      <div style={s.content}>
+        <div style={s.pageHeader}>
+          <button style={s.backBtn} onClick={() => setScreen('settings')}>←</button>
+          <h2 style={s.pageTitle}>Connected Sites</h2>
+        </div>
+        {connectedSites.length === 0 ? (
+          <div style={s.txEmpty}><p style={s.muted}>No sites connected yet</p></div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {connectedSites.map((site, i) => (
+              <div key={i} style={{ ...s.settingsItem, padding: '12px 16px' }}>
+                <div>
+                  <p style={{ ...s.settingsTitle, fontSize: 12 }}>{site}</p>
+                </div>
+                <button style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+                  onClick={() => disconnectSite(site)}>Disconnect</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+
+  // ── Reveal phrase ─────────────────────────────
   if (screen === 'revealPhrase') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -464,16 +719,14 @@ export default function Popup() {
           <>
             <div style={{ ...s.mnemonicBox, borderColor: 'rgba(251,191,36,0.3)', background: 'rgba(251,191,36,0.05)' }}>
               <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ Security Warning</p>
-              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>
-                Your recovery phrase gives full access to your wallet and funds. Never share it with anyone — not even CyberSwitch support. Anyone with this phrase can steal your funds. Make sure no one is watching your screen.
-              </p>
+              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>Your recovery phrase gives full access to your wallet. Never share it with anyone — not even CyberSwitch support.</p>
             </div>
             <button style={s.btnPrimary} onClick={() => setPhraseRevealed(true)}>I Understand — Reveal Phrase</button>
             <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Back to Safety</button>
           </>
         ) : (
           <>
-            <p style={s.bodyText}>Keep this safe. Never share it with anyone.</p>
+            <p style={s.bodyText}>Keep this safe. Never share it.</p>
             <div style={s.mnemonicBox}>{wallet?.mnemonic}</div>
             <button style={s.btnOutline} onClick={() => handleCopy(wallet?.mnemonic || '')}>{copied ? '✓ Copied!' : '⎘  Copy Phrase'}</button>
             <button style={s.btnGhost} onClick={() => { setPhraseRevealed(false); setScreen('settings') }}>← Done</button>
@@ -483,7 +736,7 @@ export default function Popup() {
     </div>
   )
 
-  // ── Confirm delete ────────────────────────────────────────
+  // ── Confirm delete ────────────────────────────
   if (screen === 'confirmDelete') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -495,33 +748,183 @@ export default function Popup() {
         <div style={{ ...s.mnemonicBox, borderColor: 'rgba(248,113,113,0.3)', background: 'rgba(248,113,113,0.05)' }}>
           <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ This cannot be undone</p>
           <p style={{ margin: 0, fontSize: 12, color: '#f87171', lineHeight: 1.7 }}>
-            {wallets.length === 1
-              ? 'This is your only wallet. Deleting it will remove all data from this device.'
-              : `${wallet?.name} will be removed. Your other wallets will remain.`}
+            {wallets.length === 1 ? 'This is your only wallet. All data will be removed.' : `${wallet?.name} will be removed. Other wallets remain.`}
             {' '}Make sure you have your recovery phrase saved.
           </p>
         </div>
-        <button
-          style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.4)' }}
+        <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.4)' }}
           onClick={() => {
             deleteWalletAtIndex(activeIndex).then(({ wallets: ws, newIndex }) => {
-              if (ws.length === 0) {
-                deleteWallet(); setWallets([]); setScreen('welcome')
-              } else {
-                setWallets(ws); setActiveIndex(newIndex)
-                refreshDashboard(ws[newIndex].address)
-                setScreen('dashboard'); showSuccess('✓ Wallet deleted')
-              }
+              if (ws.length === 0) { deleteWallet(); setWallets([]); setScreen('welcome') }
+              else { setWallets(ws); setActiveIndex(newIndex); refreshDashboard(ws[newIndex].address); showSuccess('✓ Wallet deleted') }
             })
-          }}>
-          Yes, Delete This Wallet
-        </button>
+          }}>Yes, Delete This Wallet</button>
         <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Cancel</button>
       </div>
     </div>
   )
 
-  // ── Dashboard ─────────────────────────────────────────────
+  // ── Approve Connect ───────────────────────────
+  if (screen === 'approveConnect' && pendingRequest) return (
+    <div style={s.page}>
+      <WatermarkBg />
+      <div style={s.content}>
+        <div style={{ ...s.successBadge, background: 'rgba(26,58,255,0.15)', color: '#4d8aff', border: '1px solid rgba(26,58,255,0.3)' }}>
+          🔗 Connection Request
+        </div>
+        <h2 style={s.sectionTitle}>Connect to Site</h2>
+        <div style={s.txDetailCard}>
+          {[
+            ['Site', pendingRequest.data?.origin, '#4d8aff'],
+            ['Wallet', wallet?.name || '', '#fff'],
+            ['Address', `${wallet?.address.slice(0, 10)}...${wallet?.address.slice(-6)}`, '#fff'],
+            ['Network', 'Arc Testnet', '#10b981'],
+          ].map(([label, value, color], i) => (
+            <div key={i}>
+              {i > 0 && <div style={s.txDetailDivider} />}
+              <div style={s.txDetailRow}>
+                <span style={s.txDetailLabel}>{label}</span>
+                <span style={{ ...s.txDetailValue, color: color as string, wordBreak: 'break-all' }}>{value}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <p style={s.bodyText}>This site is requesting access to your wallet address. It will NOT be able to move funds without your explicit approval.</p>
+        <button style={s.btnPrimary} onClick={() => sendApprovalResponse(true, { origin: pendingRequest.data?.origin })}>
+          Connect Wallet
+        </button>
+        <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
+          onClick={() => sendApprovalResponse(false)}>Reject</button>
+      </div>
+    </div>
+  )
+
+  // ── Approve Transaction ───────────────────────
+  if (screen === 'approveTx' && pendingRequest) {
+    const tx = pendingRequest.data?.txParams || {}
+    const value = tx.value ? (parseInt(tx.value, 16) / 1e18).toFixed(6) : '0.000000'
+    return (
+      <div style={s.page}>
+        <WatermarkBg />
+        <div style={s.content}>
+          <div style={{ ...s.successBadge, background: 'rgba(251,191,36,0.15)', color: '#fbbf24', border: '1px solid rgba(251,191,36,0.3)' }}>
+            ⚡ Transaction Request
+          </div>
+          <h2 style={s.sectionTitle}>Confirm Transaction</h2>
+          <div style={{ ...s.balanceCard, padding: '20px' }}>
+            <p style={s.balanceLabel}>SENDING</p>
+            <p style={{ ...s.balanceAmount, fontSize: 28 }}>{value}</p>
+            <p style={s.balanceCurrency}>USDC</p>
+          </div>
+          <div style={s.txDetailCard}>
+            {[
+              ['From', `${wallet?.address.slice(0, 10)}...${wallet?.address.slice(-6)}`, '#fff'],
+              ['To', `${tx.to?.slice(0, 10)}...${tx.to?.slice(-6)}`, '#fff'],
+              ['Site', pendingRequest.data?.origin, '#4d8aff'],
+              ['Network', 'Arc Testnet', '#10b981'],
+            ].map(([label, value, color], i) => (
+              <div key={i}>
+                {i > 0 && <div style={s.txDetailDivider} />}
+                <div style={s.txDetailRow}>
+                  <span style={s.txDetailLabel}>{label}</span>
+                  <span style={{ ...s.txDetailValue, color: color as string, wordBreak: 'break-all' }}>{value}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button style={s.btnPrimary} onClick={async () => {
+            if (!wallet) return
+            const tx = pendingRequest.data?.txParams || {}
+            const value = tx.value ? (parseInt(tx.value, 16) / 1e18).toFixed(6) : '0.000000'
+            const result = await sendUSDC(wallet.privateKey, tx.to, value)
+            if (result.success) {
+            await sendApprovalResponse(true, result.hash)
+            showSuccess('✓ Transaction sent!')
+          } else {
+          await sendApprovalResponse(false)
+          showSuccess(`✗ ${result.error}`)
+          }
+          }}>Confirm & Sign</button>
+          <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
+            onClick={() => sendApprovalResponse(false)}>Reject</button>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Approve Sign ──────────────────────────────
+  if (screen === 'approveSign' && pendingRequest) {
+    const message = pendingRequest.data?.message || ''
+    const decodedMsg = (() => {
+      try {
+        if (message.startsWith('0x')) {
+          const hex = message.slice(2)
+          return decodeURIComponent(hex.replace(/../g, '%$&')) || message
+        }
+        return message
+      } catch { return message }
+    })()
+
+    return (
+      <div style={s.page}>
+        <WatermarkBg />
+        <div style={s.content}>
+          <div style={{ ...s.successBadge, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', border: '1px solid rgba(139,92,246,0.3)' }}>
+            ✍️ Signature Request
+          </div>
+          <h2 style={s.sectionTitle}>Sign Message</h2>
+          <div style={s.txDetailCard}>
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Site</span>
+              <span style={{ ...s.txDetailValue, color: '#4d8aff', wordBreak: 'break-all' }}>{pendingRequest.data?.origin}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Wallet</span>
+              <span style={s.txDetailValue}>{wallet?.name}</span>
+            </div>
+          </div>
+          <div style={{ ...s.mnemonicBox, maxHeight: 120, overflowY: 'auto' }}>
+            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>MESSAGE</p>
+            <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, wordBreak: 'break-all' }}>{decodedMsg}</p>
+          </div>
+          <p style={{ ...s.bodyText, fontSize: 11 }}>
+            ⚠️ Only sign messages from sites you trust. Signing does not send a transaction but gives the site proof of your identity.
+          </p>
+          {signatureResult ? (
+            <>
+              <div style={s.addressBox}>{signatureResult}</div>
+              <button style={s.btnOutline} onClick={() => handleCopy(signatureResult)}>{copied ? '✓ Copied!' : '⎘  Copy Signature'}</button>
+              <button style={s.btnGhost} onClick={() => { setSignatureResult(''); setScreen('dashboard') }}>← Done</button>
+            </>
+          ) : (
+            <>
+            <button style={s.btnPrimary} onClick={async () => {
+              if (!wallet) return
+              try {
+              const { ethers } = await import('ethers')
+              const signer = new ethers.Wallet(wallet.privateKey)
+              const sig = await signer.signMessage(
+              message.startsWith('0x') ? ethers.getBytes(message) : message
+              )
+              setSignatureResult(sig)
+              await sendApprovalResponse(true, sig)
+              showSuccess('✓ Message signed!')
+            } catch (e: any) {
+              await sendApprovalResponse(false)
+              showSuccess(`✗ ${e.message}`)
+            }
+            }}>Sign Message</button>
+              <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
+                onClick={() => sendApprovalResponse(false)}>Reject</button>
+            </>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ── Dashboard ─────────────────────────────────
   return (
     <div style={s.page}>
       <WatermarkBg />
@@ -552,7 +955,7 @@ export default function Popup() {
           <button style={s.actionBtn} onClick={() => setScreen('send')}>
             <span style={s.actionIcon}>↑</span><span>Send</span>
           </button>
-          <button style={s.actionBtn} onClick={() => setScreen('receive')}>
+          <button style={s.actionBtn} onClick={() => { setQrDataUrl(''); setScreen('receive') }}>
             <span style={s.actionIcon}>↓</span><span>Receive</span>
           </button>
           <button style={s.actionBtn} onClick={() => refreshDashboard(wallet!.address)}>
@@ -575,15 +978,11 @@ export default function Popup() {
                       <span style={{ fontSize: 18, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '↑' : '↓'}</span>
                       <div>
                         <p style={{ margin: 0, fontSize: 13, fontWeight: 600 }}>{isSent ? 'Sent' : 'Received'}</p>
-                        <p style={{ margin: 0, fontSize: 11, color: '#7b8cde' }}>
-                          {isSent ? tx.to?.hash?.slice(0, 8) : tx.from?.hash?.slice(0, 8)}...
-                        </p>
+                        <p style={{ margin: 0, fontSize: 11, color: '#7b8cde' }}>{isSent ? tx.to?.hash?.slice(0, 8) : tx.from?.hash?.slice(0, 8)}...</p>
                       </div>
                     </div>
                     <div style={{ textAlign: 'right' }}>
-                      <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: isSent ? '#f87171' : '#10b981' }}>
-                        {isSent ? '-' : '+'}{amount} USDC
-                      </p>
+                      <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: isSent ? '#f87171' : '#10b981' }}>{isSent ? '-' : '+'}{amount} USDC</p>
                       <p style={{ margin: 0, fontSize: 10, color: '#4a5580' }}>tap for details</p>
                     </div>
                   </div>
@@ -599,7 +998,7 @@ export default function Popup() {
 
 const s: Record<string, React.CSSProperties> = {
   page: { width: 380, height: 600, background: 'linear-gradient(160deg, #04041e 0%, #060d3a 60%, #04041e 100%)', color: '#fff', fontFamily: "'Inter', sans-serif", position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' },
-  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 14, padding: 24, flex: 1, overflowY: 'auto', maxHeight: '580px' },
+  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 14, padding: 24, flex: 1, overflowY: 'auto', maxHeight: '600px' },
   center: { display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1 },
   logoRow: { display: 'flex', alignItems: 'center', gap: 12 },
   brandName: { fontSize: 17, fontWeight: 700, margin: 0, letterSpacing: 0.3 },
@@ -627,7 +1026,7 @@ const s: Record<string, React.CSSProperties> = {
   pageHeader: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 4 },
   pageTitle: { fontSize: 18, fontWeight: 700, margin: 0 },
   backBtn: { background: 'rgba(255,255,255,0.07)', border: 'none', color: '#fff', borderRadius: 8, width: 34, height: 34, cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' },
-  qrPlaceholder: { background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 16, height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  qrPlaceholder: { background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 16, height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   qrInner: { display: 'flex', flexDirection: 'column', alignItems: 'center' },
   dashHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
   networkPill: { display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: '5px 12px', fontSize: 11, color: '#7b8cde' },

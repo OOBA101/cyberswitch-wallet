@@ -1,9 +1,20 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { resolve } from 'path'
+import { copyFileSync, mkdirSync } from 'fs'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: 'copy-manifest',
+      closeBundle() {
+        copyFileSync('public/manifest.json', 'dist/manifest.json')
+        try { mkdirSync('dist/icons', { recursive: true }) } catch {}
+        console.log('✅ manifest.json copied to dist')
+      }
+    }
+  ],
   build: {
     outDir: 'dist',
     rollupOptions: {

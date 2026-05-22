@@ -1,232 +1,178 @@
-// ─────────────────────────────────────────────
-// CyberSwitch Background Service Worker
-// Handles all wallet provider requests from dApps
-// ─────────────────────────────────────────────
-
 const WALLETS_KEY = 'cyberswitch_wallets'
 const ACTIVE_KEY = 'cyberswitch_active'
 const CONNECTED_SITES_KEY = 'cyberswitch_connected_sites'
-const ARC_CHAIN_ID = '0x4CE052' // 5042002 in hex
+const ARC_CHAIN_ID = '0x4CE052'
 const ARC_RPC = 'https://rpc.testnet.arc.network'
 
-// ── Storage helpers ───────────────────────────
 const storage = {
   get: (key: string): Promise<any> =>
-    new Promise(r => chrome.storage.local.get([key], res => r(res[key]))),
+    new Promise(r => {
+      try { chrome.storage.local.get([key], (res: any) => r(res[key] ?? null)) }
+      catch { r(null) }
+    }),
   set: (key: string, value: any): Promise<void> =>
-    new Promise(r => chrome.storage.local.set({ [key]: value }, r)),
+    new Promise(r => {
+      try { chrome.storage.local.set({ [key]: value }, () => r()) }
+      catch { r() }
+    }),
+  remove: (key: string): Promise<void> =>
+    new Promise(r => {
+      try { chrome.storage.local.remove([key], () => r()) }
+      catch { r() }
+    }),
 }
 
-// ── Get active wallet ─────────────────────────
 const getActiveWallet = async () => {
-  const [wallets, idx] = await Promise.all([
-    storage.get(WALLETS_KEY),
-    storage.get(ACTIVE_KEY),
-  ])
-  if (!wallets || wallets.length === 0) return null
-  const safeIdx = Math.min(idx ?? 0, wallets.length - 1)
-  return wallets[safeIdx]
+  try {
+    const [wallets, idx] = await Promise.all([storage.get(WALLETS_KEY), storage.get(ACTIVE_KEY)])
+    if (!wallets?.length) return null
+    return wallets[Math.min(idx ?? 0, wallets.length - 1)]
+  } catch { return null }
 }
 
-// ── Get connected sites ───────────────────────
 const getConnectedSites = async (): Promise<string[]> => {
-  const sites = await storage.get(CONNECTED_SITES_KEY)
-  return sites || []
+  try { return (await storage.get(CONNECTED_SITES_KEY)) || [] }
+  catch { return [] }
 }
 
-const addConnectedSite = async (origin: string): Promise<void> => {
-  const sites = await getConnectedSites()
-  if (!sites.includes(origin)) {
-    sites.push(origin)
-    await storage.set(CONNECTED_SITES_KEY, sites)
-  }
+const addConnectedSite = async (origin: string) => {
+  try {
+    const sites = await getConnectedSites()
+    if (!sites.includes(origin)) await storage.set(CONNECTED_SITES_KEY, [...sites, origin])
+  } catch {}
 }
 
-const removeConnectedSite = async (origin: string): Promise<void> => {
-  const sites = await getConnectedSites()
-  await storage.set(CONNECTED_SITES_KEY, sites.filter(s => s !== origin))
+const removeConnectedSite = async (origin: string) => {
+  try {
+    const sites = await getConnectedSites()
+    await storage.set(CONNECTED_SITES_KEY, sites.filter((s: string) => s !== origin))
+  } catch {}
 }
 
-// ── Pending requests queue ────────────────────
-const pendingRequests = new Map<string, {
-  resolve: (value: any) => void
-  reject: (reason: any) => void
-}>()
-
-// ── Open approval popup ───────────────────────
-const openApprovalPopup = async (type: string, data: any, requestId: string) => {
-  await storage.set('cyberswitch_pending_request', { type, data, requestId })
-
-  chrome.windows.create({
-    url: chrome.runtime.getURL('index.html') + `?approval=true&requestId=${requestId}`,
-    type: 'popup',
-    width: 400,
-    height: 620,
-    focused: true,
-  })
-}
-
-// ── RPC call helper ───────────────────────────
-const rpcCall = async (method: string, params: any[] = []): Promise<any> => {
-  const response = await fetch(ARC_RPC, {
+const rpcCall = async (method: string, params: any[] = []) => {
+  const res = await fetch(ARC_RPC, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   })
-  const data = await response.json()
+  const data = await res.json()
   if (data.error) throw new Error(data.error.message)
   return data.result
 }
 
-// ── Main message handler ──────────────────────
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const { type, payload, requestId } = message
-
-  // ── Handle approval responses from popup ──
-  if (type === 'CYBERSWITCH_APPROVAL_RESPONSE') {
-    const pending = pendingRequests.get(requestId)
-    if (pending) {
-      if (payload.approved) {
-        pending.resolve(payload.result)
-      } else {
-        pending.reject({ code: 4001, message: 'User rejected the request' })
-      }
-      pendingRequests.delete(requestId)
-    }
-    sendResponse({ ok: true })
-    return true
+const openPopup = async () => {
+  try { await (chrome.action as any).openPopup() } catch {
+    try {
+      chrome.windows.create({
+        url: chrome.runtime.getURL('index.html'),
+        type: 'popup', width: 400, height: 620, focused: true,
+      })
+    } catch {}
   }
+}
 
-  // ── Handle provider requests from content script ──
-  if (type === 'CYBERSWITCH_PROVIDER_REQUEST') {
-    handleProviderRequest(payload, sender?.origin || sender?.tab?.url || '')
-      .then(result => sendResponse({ result }))
-      .catch(error => sendResponse({ error: { code: error.code || -32603, message: error.message } }))
-    return true
-  }
-
-  return false
-})
-
-// ── Provider request router ───────────────────
 const handleProviderRequest = async (request: any, origin: string): Promise<any> => {
-  const { method, params } = request
-
+  const { method, params, requestId } = request
   switch (method) {
-
-    case 'eth_chainId':
-      return ARC_CHAIN_ID
-
-    case 'net_version':
-      return '5042002'
-
+    case 'eth_chainId': return ARC_CHAIN_ID
+    case 'net_version': return '5042002'
     case 'eth_accounts': {
       const sites = await getConnectedSites()
       if (!sites.includes(origin)) return []
       const wallet = await getActiveWallet()
       return wallet ? [wallet.address] : []
     }
-
     case 'eth_requestAccounts': {
       const sites = await getConnectedSites()
       if (sites.includes(origin)) {
         const wallet = await getActiveWallet()
         return wallet ? [wallet.address] : []
       }
-
-      // Need approval
-      return new Promise((resolve, reject) => {
-        const requestId = `connect_${Date.now()}`
-        pendingRequests.set(requestId, { resolve, reject })
-        openApprovalPopup('connect', { origin }, requestId)
-        setTimeout(() => {
-          if (pendingRequests.has(requestId)) {
-            pendingRequests.delete(requestId)
-            reject({ code: 4001, message: 'Request timed out' })
-          }
-        }, 120000) // 2 min timeout
-      })
+      await storage.set('cs_pending', { type: 'connect', data: { origin }, requestId, ts: Date.now() })
+      await openPopup()
+      return 'PENDING'
     }
-
     case 'eth_sendTransaction': {
       const sites = await getConnectedSites()
-      if (!sites.includes(origin)) {
-        throw { code: 4100, message: 'Not connected. Call eth_requestAccounts first.' }
-      }
-
-      const txParams = params[0]
-      return new Promise((resolve, reject) => {
-        const requestId = `tx_${Date.now()}`
-        pendingRequests.set(requestId, { resolve, reject })
-        openApprovalPopup('transaction', { origin, txParams }, requestId)
-        setTimeout(() => {
-          if (pendingRequests.has(requestId)) {
-            pendingRequests.delete(requestId)
-            reject({ code: 4001, message: 'Request timed out' })
-          }
-        }, 120000)
-      })
+      if (!sites.includes(origin)) throw { code: 4100, message: 'Connect first.' }
+      await storage.set('cs_pending', { type: 'transaction', data: { origin, txParams: params?.[0] }, requestId, ts: Date.now() })
+      await openPopup()
+      return 'PENDING'
     }
-
-    case 'wallet_switchEthereumChain': {
-      const chainId = params[0]?.chainId
-      if (chainId !== ARC_CHAIN_ID) {
-        throw { code: 4902, message: 'CyberSwitch only supports Arc Testnet.' }
-      }
+    case 'eth_sign':
+    case 'personal_sign': {
+      const sites = await getConnectedSites()
+      if (!sites.includes(origin)) throw { code: 4100, message: 'Connect first.' }
+      const message = method === 'personal_sign' ? params?.[0] : params?.[1]
+      await storage.set('cs_pending', { type: 'sign', data: { origin, message }, requestId, ts: Date.now() })
+      await openPopup()
+      return 'PENDING'
+    }
+    case 'wallet_switchEthereumChain':
+    case 'wallet_addEthereumChain':
+      if (params?.[0]?.chainId !== ARC_CHAIN_ID) throw { code: 4902, message: 'CyberSwitch only supports Arc Testnet.' }
       return null
-    }
-
-    case 'wallet_addEthereumChain': {
-      const chainId = params[0]?.chainId
-      if (chainId !== ARC_CHAIN_ID) {
-        throw { code: 4902, message: 'CyberSwitch only supports Arc Testnet.' }
-      }
-      return null
-    }
-
-    case 'eth_getBalance': {
-      return rpcCall('eth_getBalance', params)
-    }
-
-    case 'eth_blockNumber': {
-      return rpcCall('eth_blockNumber', [])
-    }
-
-    case 'eth_getTransactionByHash': {
-      return rpcCall('eth_getTransactionByHash', params)
-    }
-
-    case 'eth_getTransactionReceipt': {
-      return rpcCall('eth_getTransactionReceipt', params)
-    }
-
-    case 'eth_call': {
-      return rpcCall('eth_call', params)
-    }
-
-    case 'eth_estimateGas': {
-      return rpcCall('eth_estimateGas', params)
-    }
-
-    case 'eth_gasPrice': {
-      return rpcCall('eth_gasPrice', [])
-    }
-
-    case 'wallet_disconnect': {
-      await removeConnectedSite(origin)
-      return null
-    }
-
-    default:
-      throw { code: -32601, message: `Method ${method} not supported` }
+    case 'eth_getBalance': return rpcCall('eth_getBalance', params)
+    case 'eth_blockNumber': return rpcCall('eth_blockNumber', [])
+    case 'eth_getTransactionByHash': return rpcCall('eth_getTransactionByHash', params)
+    case 'eth_getTransactionReceipt': return rpcCall('eth_getTransactionReceipt', params)
+    case 'eth_call': return rpcCall('eth_call', params)
+    case 'eth_estimateGas': return rpcCall('eth_estimateGas', params)
+    case 'eth_gasPrice': return rpcCall('eth_gasPrice', [])
+    case 'wallet_disconnect': await removeConnectedSite(origin); return null
+    default: throw { code: -32601, message: `Method ${method} not supported` }
   }
 }
 
-// ── Listen for approval results ───────────────
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'CYBERSWITCH_CONNECT_APPROVED') {
-    addConnectedSite(message.origin)
+chrome.runtime.onMessage.addListener((message: any, sender: any, sendResponse: any) => {
+  const { type, payload } = message
+
+  if (type === 'CYBERSWITCH_APPROVAL_RESPONSE') {
+    const { requestId, approved, origin, result } = payload
+    const handle = async () => {
+      try {
+        if (approved && requestId.startsWith('connect_') && origin) {
+          await addConnectedSite(origin)
+          const wallet = await getActiveWallet()
+          await storage.set(`cs_resp_${requestId}`, { result: wallet ? [wallet.address] : [], error: null, ts: Date.now() })
+        } else if (approved) {
+          await storage.set(`cs_resp_${requestId}`, { result: result ?? null, error: null, ts: Date.now() })
+        } else {
+          await storage.set(`cs_resp_${requestId}`, { result: null, error: { code: 4001, message: 'User rejected the request' }, ts: Date.now() })
+        }
+        await storage.remove('cs_pending')
+      } catch (e) {
+        console.error('Approval error:', e)
+        await storage.set(`cs_resp_${requestId}`, { result: null, error: { code: -32603, message: 'Internal error' }, ts: Date.now() })
+      }
+    }
+    handle().then(() => { try { sendResponse({ ok: true }) } catch {} })
+    return true
   }
+
+  if (type === 'CYBERSWITCH_PROVIDER_REQUEST') {
+    const origin = (() => {
+      try { return sender?.origin || (sender?.tab?.url ? new URL(sender.tab.url).origin : 'unknown') }
+      catch { return 'unknown' }
+    })()
+    const req = { ...payload }
+    handleProviderRequest(req, origin)
+      .then(async result => {
+        try {
+          if (result !== 'PENDING') await storage.set(`cs_resp_${req.requestId}`, { result, error: null, ts: Date.now() })
+          sendResponse({ ok: true })
+        } catch {}
+      })
+      .catch(async error => {
+        try {
+          await storage.set(`cs_resp_${req.requestId}`, { result: null, error: { code: error.code || -32603, message: error.message || 'Unknown error' }, ts: Date.now() })
+          sendResponse({ ok: true })
+        } catch {}
+      })
+    return true
+  }
+
+  return false
 })
 
 console.log('CyberSwitch background worker running ✅')
