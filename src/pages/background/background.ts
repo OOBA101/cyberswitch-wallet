@@ -1,3 +1,9 @@
+// Keep service worker alive
+const keepAlive = () => setInterval(chrome.runtime.getPlatformInfo, 20000)
+chrome.runtime.onStartup.addListener(keepAlive)
+chrome.runtime.onInstalled.addListener(keepAlive)
+keepAlive()
+
 const WALLETS_KEY = 'cyberswitch_wallets'
 const ACTIVE_KEY = 'cyberswitch_active'
 const CONNECTED_SITES_KEY = 'cyberswitch_connected_sites'
@@ -61,14 +67,15 @@ const rpcCall = async (method: string, params: any[] = []) => {
 }
 
 const openPopup = async () => {
-  try { await (chrome.action as any).openPopup() } catch {
-    try {
-      chrome.windows.create({
-        url: chrome.runtime.getURL('index.html'),
-        type: 'popup', width: 400, height: 620, focused: true,
-      })
-    } catch {}
-  }
+  return new Promise<void>((resolve) => {
+    chrome.windows.create({
+      url: chrome.runtime.getURL('index.html'),
+      type: 'popup',
+      width: 400,
+      height: 640,
+      focused: true,
+    }, () => resolve())
+  })
 }
 
 const handleProviderRequest = async (request: any, origin: string): Promise<any> => {

@@ -1,9 +1,7 @@
-// ─────────────────────────────────────────────
-// CyberSwitch Injected Provider
-// Runs in page context (not isolated world)
-// ─────────────────────────────────────────────
+;(function () {
+  if (window.__cyberswitchLoaded) return
+  window.__cyberswitchLoaded = true
 
-;(function() {
   let requestId = 0
   const pending = new Map()
 
@@ -13,37 +11,45 @@
     if (event.data?.type !== 'CYBERSWITCH_PAGE_RESPONSE') return
 
     const { requestId: id, result, error } = event.data
-    const pending_req = pending.get(id)
-    if (!pending_req) return
+    const req = pending.get(id)
+    if (!req) return
+
+    clearTimeout(req.timer)
+    pending.delete(id)
 
     if (error) {
-      const err = new Error(error.message)
+      const err = new Error(error.message || 'Request failed')
       err.code = error.code
-      pending_req.reject(err)
+      req.reject(err)
     } else {
-      pending_req.resolve(result)
+      req.resolve(result)
     }
-    pending.delete(id)
   })
 
   const sendRequest = (method, params) => {
     return new Promise((resolve, reject) => {
       const id = ++requestId
-      pending.set(id, { resolve, reject })
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error('CyberSwitch: Request timed out'))
+      }, 300000) // 5 min timeout — user needs time to approve
+
+      pending.set(id, { resolve, reject, timer })
+
       window.postMessage({
         type: 'CYBERSWITCH_PAGE_REQUEST',
         method,
         params: params || [],
-        requestId: id
+        requestId: id,
       }, '*')
-      // Timeout after 30s
-      setTimeout(() => {
-        if (pending.has(id)) {
-          pending.delete(id)
-          reject(new Error('Request timed out'))
-        }
-      }, 30000)
     })
+  }
+
+  const listeners = {}
+
+  const emit = (event, ...args) => {
+    const handlers = listeners[event] || []
+    handlers.forEach(h => { try { h(...args) } catch {} })
   }
 
   const provider = {
@@ -53,54 +59,67 @@
     networkVersion: '5042002',
     selectedAddress: null,
     _connected: false,
-    _listeners: {},
 
     on(event, handler) {
-      if (!this._listeners[event]) this._listeners[event] = []
-      this._listeners[event].push(handler)
+      if (!listeners[event]) listeners[event] = []
+      listeners[event].push(handler)
       return this
     },
 
     removeListener(event, handler) {
-      if (!this._listeners[event]) return this
-      this._listeners[event] = this._listeners[event].filter(l => l !== handler)
+      if (!listeners[event]) return this
+      listeners[event] = listeners[event].filter(l => l !== handler)
       return this
     },
 
-    emit(event, ...args) {
-      if (!this._listeners[event]) return
-      this._listeners[event].forEach(l => l(...args))
-    },
-
     async request({ method, params }) {
+      console.log('[CyberSwitch] request:', method)
+
       const result = await sendRequest(method, params)
-      if (method === 'eth_requestAccounts' && Array.isArray(result) && result.length > 0) {
-        this.selectedAddress = result[0]
-        this._connected = true
-        this.emit('accountsChanged', result)
-        this.emit('connect', { chainId: this.chainId })
+
+      console.log('[CyberSwitch] result:', method, result)
+
+      if (method === 'eth_requestAccounts' || method === 'eth_accounts') {
+        if (Array.isArray(result) && result.length > 0) {
+          const prevAddress = this.selectedAddress
+          this.selectedAddress = result[0]
+          this._connected = true
+
+          if (!prevAddress) {
+            emit('connect', { chainId: this.chainId })
+          }
+          if (prevAddress !== result[0]) {
+            emit('accountsChanged', result)
+          }
+        }
       }
+
       if (method === 'wallet_disconnect') {
         this.selectedAddress = null
         this._connected = false
-        this.emit('accountsChanged', [])
-        this.emit('disconnect', { code: 4900, message: 'Disconnected' })
+        emit('accountsChanged', [])
+        emit('disconnect', { code: 4900, message: 'Disconnected' })
       }
+
       return result
     },
 
+    // Legacy support
     async enable() {
       return this.request({ method: 'eth_requestAccounts' })
     },
 
-    async send(method, params) {
-      return this.request({ method, params })
+    async send(methodOrPayload, params) {
+      if (typeof methodOrPayload === 'string') {
+        return this.request({ method: methodOrPayload, params })
+      }
+      return this.request(methodOrPayload)
     },
 
     async sendAsync(payload, callback) {
       try {
         const result = await this.request(payload)
-        callback(null, { jsonrpc: '2.0', id: 1, result })
+        callback(null, { jsonrpc: '2.0', id: payload.id || 1, result })
       } catch (error) {
         callback(error, null)
       }
@@ -116,11 +135,13 @@
     if (event.source !== window) return
     if (event.data?.type === 'CYBERSWITCH_CHAIN_CHANGED') {
       provider.chainId = event.data.chainId
-      provider.emit('chainChanged', event.data.chainId)
+      emit('chainChanged', event.data.chainId)
     }
     if (event.data?.type === 'CYBERSWITCH_ACCOUNTS_CHANGED') {
-      provider.selectedAddress = event.data.accounts[0] || null
-      provider.emit('accountsChanged', event.data.accounts)
+      const accounts = event.data.accounts || []
+      provider.selectedAddress = accounts[0] || null
+      provider.isConnected = accounts.length > 0
+      emit('accountsChanged', accounts)
     }
   })
 
@@ -132,13 +153,10 @@
       configurable: false,
     })
   }
-  window.cyberswitch = provider
-  window.dispatchEvent(new Event('ethereum#initialized'))
 
-  console.log('CyberSwitch wallet ready ✅')
-  
-  // ── EIP-6963 Multi-wallet support ─────────────
-const announceProvider = () => {
+  window.cyberswitch = provider
+
+  // EIP-6963
   const info = {
     uuid: 'cyberswitch-wallet-v1',
     name: 'CyberSwitch Wallet',
@@ -146,14 +164,17 @@ const announceProvider = () => {
     rdns: 'com.cyberswitch.wallet'
   }
 
-  window.dispatchEvent(new CustomEvent('eip6963:announceProvider', {
-    detail: Object.freeze({ info, provider })
-  }))
-}
+  const announceProvider = () => {
+    window.dispatchEvent(new CustomEvent('eip6963:announceProvider', {
+      detail: Object.freeze({ info, provider })
+    }))
+  }
 
-window.addEventListener('eip6963:requestProvider', () => {
+  window.addEventListener('eip6963:requestProvider', announceProvider)
   announceProvider()
-})
 
-announceProvider()
+  // Fire initialized event — many dApps wait for this
+  window.dispatchEvent(new Event('ethereum#initialized'))
+
+  console.log('[CyberSwitch] Provider injected ✅', window.ethereum)
 })()

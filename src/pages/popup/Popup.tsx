@@ -4,7 +4,8 @@ import {
   createWallet, importWallet, loadWallets,
   loadActiveIndex, saveActiveIndex, addWallet,
   deleteWalletAtIndex, deleteWallet,
-  setPassword, verifyPassword, hasPassword, removePassword
+  setPassword, verifyPassword, hasPassword,
+  removePassword
 } from '../../utils/wallet.ts'
 import type { WalletData } from '../../utils/wallet.ts'
 import { getUSDCBalance, sendUSDC, getTransactions } from '../../utils/arc'
@@ -72,25 +73,24 @@ export default function Popup() {
   // ── Init ──────────────────────────────────────
   useEffect(() => {
     const init = async () => {
-      const [ws, idx, hasPwd] = await Promise.all([
-        loadWallets(),
-        loadActiveIndex(),
-        hasPassword(),
-      ])
-      if (ws.length === 0) {
+      try {
+        const [ws, idx, hasPwd] = await Promise.all([
+          loadWallets(),
+          loadActiveIndex(),
+          hasPassword(),
+        ])
+        if (ws.length === 0) { setScreen('welcome'); return }
+        setWallets(ws)
+        const safeIdx = Math.min(idx, ws.length - 1)
+        setActiveIndex(safeIdx)
+        ws.forEach(w => getUSDCBalance(w.address).then(b =>
+          setBalances(prev => ({ ...prev, [w.address]: b }))
+        ))
+        if (hasPwd) { setScreen('locked') }
+        else { refreshDashboard(ws[safeIdx].address) }
+      } catch (e) {
+        console.error('Init error:', e)
         setScreen('welcome')
-        return
-      }
-      setWallets(ws)
-      const safeIdx = Math.min(idx, ws.length - 1)
-      setActiveIndex(safeIdx)
-      ws.forEach(w => getUSDCBalance(w.address).then(b =>
-        setBalances(prev => ({ ...prev, [w.address]: b }))
-      ))
-      if (hasPwd) {
-        setScreen('locked')
-      } else {
-        refreshDashboard(ws[safeIdx].address)
       }
     }
     init()
@@ -104,6 +104,7 @@ export default function Popup() {
       ch.storage.local.get(['cs_pending'], (res: any) => {
         const pending = res['cs_pending']
         if (pending && Date.now() - pending.ts < 120000) {
+          console.log('Found pending request:', pending.type, pending.requestId)
           setPendingRequest(pending)
           if (pending.type === 'connect') setScreen('approveConnect')
           if (pending.type === 'transaction') setScreen('approveTx')
@@ -111,6 +112,7 @@ export default function Popup() {
         }
       })
     }
+
     check()
     let attempts = 0
     const interval = setInterval(() => {
@@ -118,11 +120,13 @@ export default function Popup() {
       check()
       if (attempts >= 20) clearInterval(interval)
     }, 500)
+
     const ch = (globalThis as any).chrome
     if (ch?.storage?.onChanged) {
       const listener = (changes: any) => {
         if (changes['cs_pending']?.newValue) {
           const pending = changes['cs_pending'].newValue
+          console.log('Storage changed - new pending:', pending.type, pending.requestId)
           setPendingRequest(pending)
           if (pending.type === 'connect') setScreen('approveConnect')
           if (pending.type === 'transaction') setScreen('approveTx')
@@ -153,71 +157,90 @@ export default function Popup() {
     setTimeout(() => setSuccessMsg(''), 4000)
   }
 
+  // ── KEY FIX: Write directly to storage ───────
   const sendApprovalResponse = async (approved: boolean, result?: any) => {
-  if (!pendingRequest) return
+  console.log('[CyberSwitch Popup] sendApprovalResponse:', { approved, type: pendingRequest?.type, requestId: pendingRequest?.requestId })
+
+  if (!pendingRequest) {
+    console.error('[CyberSwitch Popup] No pending request!')
+    return
+  }
+
   const ch = (globalThis as any).chrome
-  if (!ch?.storage?.local) return
+  if (!ch?.storage?.local) {
+    console.error('[CyberSwitch Popup] No chrome storage!')
+    return
+  }
 
   const requestId = pendingRequest.requestId
   const origin = pendingRequest.data?.origin
+  const storageKey = `cs_resp_${requestId}`
 
   try {
+    let responsePayload: any
+
     if (approved && requestId.startsWith('connect_') && origin) {
-      // Add to connected sites directly from popup
-      await new Promise<void>(r => {
-        ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
-          const sites = res['cyberswitch_connected_sites'] || []
-          if (!sites.includes(origin)) {
-            ch.storage.local.set({ cyberswitch_connected_sites: [...sites, origin] }, r)
-          } else { r() }
+      // Step 1: Add site to connected list
+      await new Promise<void>((res, rej) => {
+        ch.storage.local.get(['cyberswitch_connected_sites'], (data: any) => {
+          if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
+          const sites: string[] = data['cyberswitch_connected_sites'] || []
+          const updated = sites.includes(origin) ? sites : [...sites, origin]
+          ch.storage.local.set({ cyberswitch_connected_sites: updated }, () => {
+            if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
+            console.log('[CyberSwitch Popup] Site saved:', origin)
+            res()
+          })
         })
       })
 
-      // Get active wallet directly
-      await new Promise<void>(r => {
-        ch.storage.local.get(['cyberswitch_wallets', 'cyberswitch_active'], (res: any) => {
-          const ws = res['cyberswitch_wallets'] || []
-          const idx = Math.min(res['cyberswitch_active'] ?? 0, ws.length - 1)
-          const w = ws[idx]
-          const addresses = w ? [w.address] : []
-          ch.storage.local.set({
-            [`cs_resp_${requestId}`]: { result: addresses, error: null, ts: Date.now() }
-          }, r)
-        })
-      })
+      // Get wallet address (stored plaintext)
+  // Read address directly using wallets already in React state
+const addresses: string[] = wallet?.address ? [wallet.address] : []
+console.log('[CyberSwitch Popup] Using wallet from state:', addresses)
 
-    } else if (approved && requestId.startsWith('tx_')) {
-      await new Promise<void>(r => {
-        ch.storage.local.set({
-          [`cs_resp_${requestId}`]: { result: result ?? null, error: null, ts: Date.now() }
-        }, r)
-      })
+console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
 
-    } else if (approved && requestId.startsWith('sign_')) {
-      await new Promise<void>(r => {
-        ch.storage.local.set({
-          [`cs_resp_${requestId}`]: { result: result ?? null, error: null, ts: Date.now() }
-        }, r)
-      })
+      console.log('[CyberSwitch Popup] Resolving with addresses:', addresses)
+      responsePayload = { result: addresses, error: null, ts: Date.now() }
 
+    } else if (approved) {
+      responsePayload = { result: result ?? null, error: null, ts: Date.now() }
     } else {
-      // Rejected
-      await new Promise<void>(r => {
-        ch.storage.local.set({
-          [`cs_resp_${requestId}`]: {
-            result: null,
-            error: { code: 4001, message: 'User rejected the request' },
-            ts: Date.now()
-          }
-        }, r)
-      })
+      responsePayload = {
+        result: null,
+        error: { code: 4001, message: 'User rejected the request' },
+        ts: Date.now()
+      }
     }
 
+    // Write response — await confirmation
+    await new Promise<void>((res, rej) => {
+      ch.storage.local.set({ [storageKey]: responsePayload }, () => {
+        if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
+        console.log('[CyberSwitch Popup] ✅ Response written to storage:', storageKey, responsePayload)
+        res()
+      })
+    })
+
+    // Small delay to ensure content script picks up before popup state changes
+    await new Promise(res => setTimeout(res, 300))
+
     // Clean up pending
-    await new Promise<void>(r => ch.storage.local.remove(['cs_pending'], r))
+    await new Promise<void>(res => ch.storage.local.remove(['cs_pending'], res))
+
+    console.log('[CyberSwitch Popup] Flow complete ✅')
 
   } catch (e) {
-    console.error('sendApprovalResponse error:', e)
+    console.error('[CyberSwitch Popup] sendApprovalResponse error:', e)
+    // Write error response so content script doesn't hang
+    try {
+      await new Promise<void>(res => {
+        ch.storage.local.set({
+          [storageKey]: { result: null, error: { code: -32603, message: 'Internal error' }, ts: Date.now() }
+        }, res)
+      })
+    } catch {}
   }
 
   setPendingRequest(null)
@@ -226,17 +249,24 @@ export default function Popup() {
 
   const generateQR = async (address: string) => {
     try {
-      const url = await QRCode.toDataURL(address, { width: 200, margin: 2, color: { dark: '#ffffff', light: '#0d1b6e' } })
+      const url = await QRCode.toDataURL(address, {
+        width: 200, margin: 2,
+        color: { dark: '#ffffff', light: '#0d1b6e' }
+      })
       setQrDataUrl(url)
     } catch {}
   }
 
   const formatDate = (ts: string) => {
     if (!ts) return '—'
-    return new Date(ts).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+    return new Date(ts).toLocaleString('en-GB', {
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    })
   }
 
-  const openExplorer = (hash: string) => window.open(`https://testnet.arcscan.app/tx/${hash}`, '_blank')
+  const openExplorer = (hash: string) =>
+    window.open(`https://testnet.arcscan.app/tx/${hash}`, '_blank')
 
   const loadConnectedSites = () => {
     const ch = (globalThis as any).chrome
@@ -272,33 +302,36 @@ export default function Popup() {
           <input style={s.input} type="password" placeholder="Enter password"
             value={passwordInput} onChange={e => setPasswordInput(e.target.value)}
             onKeyDown={async e => {
-              if (e.key === 'Enter') {
-                const ok = await verifyPassword(passwordInput)
-                if (ok) { setPasswordInput(''); setError(''); refreshDashboard(wallets[activeIndex].address) }
-                else setError('Incorrect password')
-              }
+              if (e.key !== 'Enter') return
+              const ok = await verifyPassword(passwordInput)
+              if (ok) { setPasswordInput(''); setError(''); const ws = await loadWallets(); setWallets(ws); refreshDashboard(ws[activeIndex]?.address || ws[0]?.address) }
+              else setError('Incorrect password')
             }} />
         </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={async () => {
           const ok = await verifyPassword(passwordInput)
-          if (ok) { setPasswordInput(''); setError(''); refreshDashboard(wallets[activeIndex].address) }
-          else setError('Incorrect password')
+          if (ok) {
+            setPasswordInput(''); setError('')
+            const ws = await loadWallets()
+            setWallets(ws)
+            refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
+          } else setError('Incorrect password')
         }}>Unlock</button>
       </div>
     </div>
   )
 
-  // ── Set password (first time) ─────────────────
+  // ── Set password ──────────────────────────────
   if (screen === 'setPassword') return (
     <div style={s.page}>
       <WatermarkBg />
       <div style={s.content}>
         <div style={s.pageHeader}>
-          <button style={s.backBtn} onClick={() => setScreen('dashboard')}>←</button>
+          <button style={s.backBtn} onClick={() => setScreen('settings')}>←</button>
           <h2 style={s.pageTitle}>Set Password</h2>
         </div>
-        <p style={s.bodyText}>Create a password to protect your wallet. You'll need this every time you open CyberSwitch.</p>
+        <p style={s.bodyText}>Protect your wallet with a password. Required every time you open CyberSwitch.</p>
         <div style={s.inputGroup}>
           <label style={s.label}>New Password</label>
           <input style={s.input} type="password" placeholder="Min 6 characters"
@@ -311,12 +344,11 @@ export default function Popup() {
         </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={async () => {
-          if (passwordInput.length < 6) { setError('Password must be at least 6 characters'); return }
+          if (passwordInput.length < 6) { setError('At least 6 characters'); return }
           if (passwordInput !== passwordConfirm) { setError('Passwords do not match'); return }
           await setPassword(passwordInput)
           setPasswordInput(''); setPasswordConfirm(''); setError('')
-          showSuccess('✓ Password set successfully!')
-          setScreen('settings')
+          showSuccess('✓ Password set!'); setScreen('settings')
         }}>Set Password</button>
         <button style={s.btnGhost} onClick={() => { setPasswordInput(''); setPasswordConfirm(''); setScreen('settings') }}>← Cancel</button>
       </div>
@@ -334,8 +366,7 @@ export default function Popup() {
         </div>
         <div style={s.inputGroup}>
           <label style={s.label}>Current Password</label>
-          <input style={s.input} type="password" placeholder="Current password"
-            value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
+          <input style={s.input} type="password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
         </div>
         <div style={s.inputGroup}>
           <label style={s.label}>New Password</label>
@@ -349,8 +380,7 @@ export default function Popup() {
           if (passwordConfirm.length < 6) { setError('New password too short'); return }
           await setPassword(passwordConfirm)
           setPasswordInput(''); setPasswordConfirm(''); setError('')
-          showSuccess('✓ Password changed!')
-          setScreen('settings')
+          showSuccess('✓ Password changed!'); setScreen('settings')
         }}>Change Password</button>
         <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Cancel</button>
       </div>
@@ -372,10 +402,11 @@ export default function Popup() {
         <div style={s.divider} />
         <h1 style={s.heroTitle}>Your Web3 Wallet</h1>
         <p style={s.heroSub}>Send, receive and bridge USDC seamlessly on Arc network</p>
-        <button style={s.btnPrimary} onClick={() => {
+        <button style={s.btnPrimary} onClick={async () => {
           const w = createWallet('Wallet 1')
           setNewMnemonic(w.mnemonic)
-          addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
+          const { wallets: ws, index } = await addWallet(w)
+          setWallets(ws); setActiveIndex(index)
           setScreen('showPhrase')
         }}>Create New Wallet</button>
         <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('import') }}>
@@ -392,20 +423,13 @@ export default function Popup() {
       <div style={s.content}>
         <div style={s.successBadge}>✓ Wallet Created</div>
         <h2 style={s.sectionTitle}>Save Your Recovery Phrase</h2>
-        <p style={s.bodyText}>Write this down and store it safely. It's the only way to recover your wallet.</p>
+        <p style={s.bodyText}>Write this down. It's the only way to recover your wallet.</p>
         <div style={s.mnemonicBox}>{newMnemonic}</div>
         <button style={s.btnOutline} onClick={() => handleCopy(newMnemonic)}>{copied ? '✓ Copied!' : '⎘  Copy Phrase'}</button>
-        <button style={s.btnPrimary} onClick={async () => {
-          const hasPwd = await hasPassword()
+        <button style={s.btnPrimary} onClick={() => {
           const w = wallets[activeIndex]
-          if (w) {
-            if (!hasPwd) {
-              refreshDashboard(w.address)
-              showSuccess('💡 Set a password in Settings to secure your wallet')
-            } else {
-              refreshDashboard(w.address)
-            }
-          } else setScreen('dashboard')
+          if (w) refreshDashboard(w.address)
+          else setScreen('dashboard')
         }}>I've saved it safely →</button>
       </div>
     </div>
@@ -424,15 +448,14 @@ export default function Popup() {
         <textarea style={s.textarea} placeholder="word1 word2 word3 ..."
           value={importPhrase} onChange={e => setImportPhrase(e.target.value)} />
         {error && <p style={s.error}>{error}</p>}
-        <button style={s.btnPrimary} onClick={() => {
+        <button style={s.btnPrimary} onClick={async () => {
           try {
             const name = `Wallet ${wallets.length + 1}`
             const w = importWallet(importPhrase.trim(), name)
-            addWallet(w).then(({ wallets: ws, index }) => {
-              setWallets(ws); setActiveIndex(index)
-              refreshDashboard(w.address)
-              showSuccess(`✓ ${name} imported!`)
-            })
+            const { wallets: ws, index } = await addWallet(w)
+            setWallets(ws); setActiveIndex(index)
+            refreshDashboard(w.address)
+            showSuccess(`✓ ${name} imported!`)
           } catch { setError('Invalid recovery phrase.') }
         }}>Import Wallet</button>
       </div>
@@ -449,11 +472,12 @@ export default function Popup() {
           <h2 style={s.pageTitle}>Add Wallet</h2>
         </div>
         <p style={s.bodyText}>Add another wallet to your CyberSwitch.</p>
-        <button style={s.btnPrimary} onClick={() => {
+        <button style={s.btnPrimary} onClick={async () => {
           const name = `Wallet ${wallets.length + 1}`
           const w = createWallet(name)
           setNewMnemonic(w.mnemonic)
-          addWallet(w).then(({ wallets: ws, index }) => { setWallets(ws); setActiveIndex(index) })
+          const { wallets: ws, index } = await addWallet(w)
+          setWallets(ws); setActiveIndex(index)
           setScreen('addShowPhrase')
         }}>Create New Wallet</button>
         <button style={s.btnSecondary} onClick={() => { setError(''); setImportPhrase(''); setScreen('addImport') }}>
@@ -502,24 +526,14 @@ export default function Popup() {
         </div>
         <p style={s.bodyText}>Share your Arc wallet address to receive USDC</p>
         <div style={s.qrPlaceholder}>
-          {qrDataUrl ? (
-            <img src={qrDataUrl} alt="QR Code" style={{ width: 180, height: 180, borderRadius: 8 }} />
-          ) : (
-            <div style={s.qrInner}>
-              <CyberSwitchLogo size={48} />
-              <p style={{ ...s.muted, fontSize: 11, marginTop: 8 }}>Tap to generate QR</p>
-            </div>
-          )}
+          {qrDataUrl
+            ? <img src={qrDataUrl} alt="QR Code" style={{ width: 180, height: 180, borderRadius: 8 }} />
+            : <div style={s.qrInner}><CyberSwitchLogo size={48} /><p style={{ ...s.muted, fontSize: 11, marginTop: 8 }}>Tap to generate QR</p></div>
+          }
         </div>
-        {!qrDataUrl && (
-          <button style={s.btnSecondary} onClick={() => wallet && generateQR(wallet.address)}>
-            Generate QR Code
-          </button>
-        )}
+        {!qrDataUrl && <button style={s.btnSecondary} onClick={() => wallet && generateQR(wallet.address)}>Generate QR Code</button>}
         <div style={s.addressBox}>{wallet?.address}</div>
-        <button style={s.btnPrimary} onClick={() => handleCopy(wallet?.address || '')}>
-          {copied ? '✓ Copied!' : '⎘  Copy Address'}
-        </button>
+        <button style={s.btnPrimary} onClick={() => handleCopy(wallet?.address || '')}>{copied ? '✓ Copied!' : '⎘  Copy Address'}</button>
       </div>
     </div>
   )
@@ -585,7 +599,7 @@ export default function Popup() {
     const isSent = selectedTx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
     const amount = selectedTx.value ? (parseFloat(selectedTx.value) / 1e18).toFixed(6) : '0.000000'
     const hash = selectedTx.hash || ''
-    const status = selectedTx.status === 'ok' ? 'Success' : selectedTx.status || 'Unknown'
+    const status = selectedTx.status === 'ok' ? 'Success' : 'Unknown'
     return (
       <div style={s.page}>
         <WatermarkBg />
@@ -642,36 +656,27 @@ export default function Popup() {
           <button style={s.backBtn} onClick={() => setScreen('dashboard')}>←</button>
           <h2 style={s.pageTitle}>Settings</h2>
         </div>
-        <div style={s.settingsItem} onClick={() => setScreen('addWallet')}>
-          <div><p style={s.settingsTitle}>Add Wallet</p><p style={s.settingsSub}>Create or import another wallet</p></div>
-          <span style={s.settingsArrow}>→</span>
-        </div>
-        <div style={s.settingsItem} onClick={() => { setPhraseRevealed(false); setScreen('revealPhrase') }}>
-          <div><p style={s.settingsTitle}>Reveal Recovery Phrase</p><p style={s.settingsSub}>View seed phrase for {wallet?.name}</p></div>
-          <span style={s.settingsArrow}>→</span>
-        </div>
-        <div style={s.settingsItem} onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
-          <div><p style={s.settingsTitle}>Connected Sites</p><p style={s.settingsSub}>Manage dApp connections</p></div>
-          <span style={s.settingsArrow}>→</span>
-        </div>
+        {[
+          { title: 'Add Wallet', sub: 'Create or import another wallet', action: () => setScreen('addWallet') },
+          { title: 'Reveal Recovery Phrase', sub: `View seed phrase for ${wallet?.name}`, action: () => { setPhraseRevealed(false); setScreen('revealPhrase') } },
+          { title: 'Connected Sites', sub: 'Manage dApp connections', action: () => { loadConnectedSites(); setScreen('connectedSites') } },
+          { title: 'Password', sub: 'Set or change wallet password', action: async () => { const h = await hasPassword(); setPasswordInput(''); setPasswordConfirm(''); setError(''); setScreen(h ? 'changePassword' : 'setPassword') } },
+        ].map((item, i) => (
+          <div key={i} style={s.settingsItem} onClick={item.action}>
+            <div><p style={s.settingsTitle}>{item.title}</p><p style={s.settingsSub}>{item.sub}</p></div>
+            <span style={s.settingsArrow}>→</span>
+          </div>
+        ))}
         <div style={s.settingsItem} onClick={async () => {
-          const hasPwd = await hasPassword()
-          setPasswordInput(''); setPasswordConfirm(''); setError('')
-          setScreen(hasPwd ? 'changePassword' : 'setPassword')
-        }}>
-          <div><p style={s.settingsTitle}>Password</p><p style={s.settingsSub}>Set or change your wallet password</p></div>
-          <span style={s.settingsArrow}>→</span>
-        </div>
-        <div style={s.settingsItem} onClick={async () => {
-          const hasPwd = await hasPassword()
-          if (hasPwd) { removePassword(); showSuccess('✓ Password removed') }
+          const h = await hasPassword()
+          if (h) { await removePassword(); showSuccess('✓ Password removed') }
           else showSuccess('No password set')
         }}>
           <div><p style={s.settingsTitle}>Remove Password</p><p style={s.settingsSub}>Disable password protection</p></div>
           <span style={s.settingsArrow}>→</span>
         </div>
         <div style={{ ...s.settingsItem, borderColor: 'rgba(248,113,113,0.2)' }} onClick={() => setScreen('confirmDelete')}>
-          <div><p style={{ ...s.settingsTitle, color: '#f87171' }}>Delete {wallet?.name}</p><p style={s.settingsSub}>Remove this wallet from device</p></div>
+          <div><p style={{ ...s.settingsTitle, color: '#f87171' }}>Delete {wallet?.name}</p><p style={s.settingsSub}>Remove this wallet</p></div>
           <span style={{ ...s.settingsArrow, color: '#f87171' }}>→</span>
         </div>
       </div>
@@ -687,21 +692,16 @@ export default function Popup() {
           <button style={s.backBtn} onClick={() => setScreen('settings')}>←</button>
           <h2 style={s.pageTitle}>Connected Sites</h2>
         </div>
-        {connectedSites.length === 0 ? (
-          <div style={s.txEmpty}><p style={s.muted}>No sites connected yet</p></div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {connectedSites.map((site, i) => (
-              <div key={i} style={{ ...s.settingsItem, padding: '12px 16px' }}>
-                <div>
-                  <p style={{ ...s.settingsTitle, fontSize: 12 }}>{site}</p>
-                </div>
-                <button style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
-                  onClick={() => disconnectSite(site)}>Disconnect</button>
-              </div>
-            ))}
-          </div>
-        )}
+        {connectedSites.length === 0
+          ? <div style={s.txEmpty}><p style={s.muted}>No sites connected yet</p></div>
+          : connectedSites.map((site, i) => (
+            <div key={i} style={{ ...s.settingsItem, padding: '12px 16px' }}>
+              <p style={{ ...s.settingsTitle, fontSize: 12, margin: 0 }}>{site}</p>
+              <button style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+                onClick={() => disconnectSite(site)}>Disconnect</button>
+            </div>
+          ))
+        }
       </div>
     </div>
   )
@@ -719,10 +719,10 @@ export default function Popup() {
           <>
             <div style={{ ...s.mnemonicBox, borderColor: 'rgba(251,191,36,0.3)', background: 'rgba(251,191,36,0.05)' }}>
               <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ Security Warning</p>
-              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>Your recovery phrase gives full access to your wallet. Never share it with anyone — not even CyberSwitch support.</p>
+              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>Never share your recovery phrase. Not even with CyberSwitch support.</p>
             </div>
             <button style={s.btnPrimary} onClick={() => setPhraseRevealed(true)}>I Understand — Reveal Phrase</button>
-            <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Back to Safety</button>
+            <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Back</button>
           </>
         ) : (
           <>
@@ -746,19 +746,18 @@ export default function Popup() {
           <h2 style={{ ...s.pageTitle, color: '#f87171' }}>Delete {wallet?.name}</h2>
         </div>
         <div style={{ ...s.mnemonicBox, borderColor: 'rgba(248,113,113,0.3)', background: 'rgba(248,113,113,0.05)' }}>
-          <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ This cannot be undone</p>
+          <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ Cannot be undone</p>
           <p style={{ margin: 0, fontSize: 12, color: '#f87171', lineHeight: 1.7 }}>
-            {wallets.length === 1 ? 'This is your only wallet. All data will be removed.' : `${wallet?.name} will be removed. Other wallets remain.`}
-            {' '}Make sure you have your recovery phrase saved.
+            {wallets.length === 1 ? 'All data will be removed.' : `${wallet?.name} will be removed.`}
+            {' '}Save your recovery phrase first.
           </p>
         </div>
         <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.4)' }}
-          onClick={() => {
-            deleteWalletAtIndex(activeIndex).then(({ wallets: ws, newIndex }) => {
-              if (ws.length === 0) { deleteWallet(); setWallets([]); setScreen('welcome') }
-              else { setWallets(ws); setActiveIndex(newIndex); refreshDashboard(ws[newIndex].address); showSuccess('✓ Wallet deleted') }
-            })
-          }}>Yes, Delete This Wallet</button>
+          onClick={async () => {
+            const { wallets: ws, newIndex } = await deleteWalletAtIndex(activeIndex)
+            if (ws.length === 0) { deleteWallet(); setWallets([]); setScreen('welcome') }
+            else { setWallets(ws); setActiveIndex(newIndex); refreshDashboard(ws[newIndex].address); showSuccess('✓ Wallet deleted') }
+          }}>Yes, Delete</button>
         <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Cancel</button>
       </div>
     </div>
@@ -789,10 +788,8 @@ export default function Popup() {
             </div>
           ))}
         </div>
-        <p style={s.bodyText}>This site is requesting access to your wallet address. It will NOT be able to move funds without your explicit approval.</p>
-        <button style={s.btnPrimary} onClick={() => sendApprovalResponse(true, { origin: pendingRequest.data?.origin })}>
-          Connect Wallet
-        </button>
+        <p style={s.bodyText}>This site wants access to your wallet address. It cannot move funds without approval.</p>
+        <button style={s.btnPrimary} onClick={() => sendApprovalResponse(true)}>Connect Wallet</button>
         <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
           onClick={() => sendApprovalResponse(false)}>Reject</button>
       </div>
@@ -834,16 +831,9 @@ export default function Popup() {
           </div>
           <button style={s.btnPrimary} onClick={async () => {
             if (!wallet) return
-            const tx = pendingRequest.data?.txParams || {}
-            const value = tx.value ? (parseInt(tx.value, 16) / 1e18).toFixed(6) : '0.000000'
             const result = await sendUSDC(wallet.privateKey, tx.to, value)
-            if (result.success) {
-            await sendApprovalResponse(true, result.hash)
-            showSuccess('✓ Transaction sent!')
-          } else {
-          await sendApprovalResponse(false)
-          showSuccess(`✗ ${result.error}`)
-          }
+            if (result.success) { await sendApprovalResponse(true, result.hash); showSuccess('✓ Transaction sent!') }
+            else { await sendApprovalResponse(false); showSuccess(`✗ ${result.error}`) }
           }}>Confirm & Sign</button>
           <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
             onClick={() => sendApprovalResponse(false)}>Reject</button>
@@ -858,13 +848,12 @@ export default function Popup() {
     const decodedMsg = (() => {
       try {
         if (message.startsWith('0x')) {
-          const hex = message.slice(2)
-          return decodeURIComponent(hex.replace(/../g, '%$&')) || message
+          const bytes = message.slice(2).match(/../g) || []
+          return bytes.map((h: string) => String.fromCharCode(parseInt(h, 16))).join('') || message
         }
         return message
       } catch { return message }
     })()
-
     return (
       <div style={s.page}>
         <WatermarkBg />
@@ -885,12 +874,10 @@ export default function Popup() {
             </div>
           </div>
           <div style={{ ...s.mnemonicBox, maxHeight: 120, overflowY: 'auto' }}>
-            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>MESSAGE</p>
+            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde' }}>MESSAGE</p>
             <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, wordBreak: 'break-all' }}>{decodedMsg}</p>
           </div>
-          <p style={{ ...s.bodyText, fontSize: 11 }}>
-            ⚠️ Only sign messages from sites you trust. Signing does not send a transaction but gives the site proof of your identity.
-          </p>
+          <p style={{ ...s.bodyText, fontSize: 11 }}>⚠️ Only sign from trusted sites. This proves your identity but does not send funds.</p>
           {signatureResult ? (
             <>
               <div style={s.addressBox}>{signatureResult}</div>
@@ -899,22 +886,20 @@ export default function Popup() {
             </>
           ) : (
             <>
-            <button style={s.btnPrimary} onClick={async () => {
-              if (!wallet) return
-              try {
-              const { ethers } = await import('ethers')
-              const signer = new ethers.Wallet(wallet.privateKey)
-              const sig = await signer.signMessage(
-              message.startsWith('0x') ? ethers.getBytes(message) : message
-              )
-              setSignatureResult(sig)
-              await sendApprovalResponse(true, sig)
-              showSuccess('✓ Message signed!')
-            } catch (e: any) {
-              await sendApprovalResponse(false)
-              showSuccess(`✗ ${e.message}`)
-            }
-            }}>Sign Message</button>
+              <button style={s.btnPrimary} onClick={async () => {
+                if (!wallet) return
+                try {
+                  const { ethers } = await import('ethers')
+                  const signer = new ethers.Wallet(wallet.privateKey)
+                  const sig = await signer.signMessage(message.startsWith('0x') ? ethers.getBytes(message) : message)
+                  setSignatureResult(sig)
+                  await sendApprovalResponse(true, sig)
+                  showSuccess('✓ Message signed!')
+                } catch (e: any) {
+                  await sendApprovalResponse(false)
+                  showSuccess(`✗ ${e.message}`)
+                }
+              }}>Sign Message</button>
               <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
                 onClick={() => sendApprovalResponse(false)}>Reject</button>
             </>
@@ -958,16 +943,15 @@ export default function Popup() {
           <button style={s.actionBtn} onClick={() => { setQrDataUrl(''); setScreen('receive') }}>
             <span style={s.actionIcon}>↓</span><span>Receive</span>
           </button>
-          <button style={s.actionBtn} onClick={() => refreshDashboard(wallet!.address)}>
+          <button style={s.actionBtn} onClick={() => wallet && refreshDashboard(wallet.address)}>
             <span style={s.actionIcon}>↺</span><span>Refresh</span>
           </button>
         </div>
         <div style={s.txSection}>
           <p style={s.txTitle}>Recent Transactions</p>
-          {transactions.length === 0 ? (
-            <div style={s.txEmpty}><p style={s.muted}>No transactions yet</p></div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {transactions.length === 0
+            ? <div style={s.txEmpty}><p style={s.muted}>No transactions yet</p></div>
+            : <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {transactions.slice(0, 5).map((tx: any, i: number) => {
                 const isSent = tx.from?.hash?.toLowerCase() === wallet?.address.toLowerCase()
                 const amount = tx.value ? (parseFloat(tx.value) / 1e18).toFixed(2) : '0.00'
@@ -989,7 +973,7 @@ export default function Popup() {
                 )
               })}
             </div>
-          )}
+          }
         </div>
       </div>
     </div>
