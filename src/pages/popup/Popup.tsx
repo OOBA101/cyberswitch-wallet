@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import QRCode from 'qrcode'
 import {
   createWallet, importWallet, loadWallets,
@@ -67,24 +67,28 @@ export default function Popup() {
   const [passwordConfirm, setPasswordConfirm] = useState('')
   const [connectedSites, setConnectedSites] = useState<string[]>([])
   const [signatureResult, setSignatureResult] = useState('')
-  const [connectedToCurrentSite, setConnectedToCurrentSite] = useState<boolean>(false)
+  const [connectedToCurrentSite, setConnectedToCurrentSite] = useState(false)
   const [currentTabOrigin, setCurrentTabOrigin] = useState('')
   const [signToConnectPending, setSignToConnectPending] = useState<any>(null)
   const [signLoading, setSignLoading] = useState(false)
+
+  // ── Refs for approval flow control ───────────
+  // Tracks requestIds already shown/handled — survives re-renders
+  const handledRequestIds = useRef(new Set<string>())
+  // Lock: true while user is actively in an approval screen
+  const isHandlingApproval = useRef(false)
 
   const wallet = wallets[activeIndex] || null
 
   // ── Init ──────────────────────────────────────
   useEffect(() => {
-    // Clear badge when popup opens
-    const ch2 = (globalThis as any).chrome
-      if (ch2?.action) ch2.action.setBadgeText({ text: '' })
+    const ch = (globalThis as any).chrome
+    if (ch?.action) ch.action.setBadgeText({ text: '' })
+
     const init = async () => {
       try {
         const [ws, idx, hasPwd] = await Promise.all([
-          loadWallets(),
-          loadActiveIndex(),
-          hasPassword(),
+          loadWallets(), loadActiveIndex(), hasPassword(),
         ])
         if (ws.length === 0) { setScreen('welcome'); return }
         setWallets(ws)
@@ -103,70 +107,98 @@ export default function Popup() {
     init()
   }, [])
 
-  // ── Check connection status for current tab ───
+  // ── Check current tab connection status ───────
   useEffect(() => {
-    const checkTabConnection = () => {
-      const ch = (globalThis as any).chrome
-      if (!ch?.tabs || !ch?.storage?.local) return
-      ch.tabs.query({ active: true, currentWindow: true }, (tabs: any[]) => {
-        if (!tabs[0]?.url) return
-        try {
-          const origin = new URL(tabs[0].url).origin
-          setCurrentTabOrigin(origin)
-          ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
-            const sites: string[] = res['cyberswitch_connected_sites'] || []
-            setConnectedToCurrentSite(sites.includes(origin))
-          })
-        } catch {}
-      })
-    }
-    checkTabConnection()
+    const ch = (globalThis as any).chrome
+    if (!ch?.tabs || !ch?.storage?.local) return
+    ch.tabs.query({ active: true, currentWindow: true }, (tabs: any[]) => {
+      if (!tabs[0]?.url) return
+      try {
+        const origin = new URL(tabs[0].url).origin
+        setCurrentTabOrigin(origin)
+        ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+          const sites: string[] = res['cyberswitch_connected_sites'] || []
+          setConnectedToCurrentSite(sites.includes(origin))
+        })
+      } catch {}
+    })
   }, [screen, connectedSites])
 
   // ── Check pending approvals ───────────────────
   useEffect(() => {
-    const check = () => {
-      const ch = (globalThis as any).chrome
-      if (!ch?.storage?.local) return
-      ch.storage.local.get(['cs_pending'], (res: any) => {
-        const pending = res['cs_pending']
-        if (pending && Date.now() - pending.ts < 120000) {
+    const ch = (globalThis as any).chrome
+    if (!ch?.storage?.local) return
+
+    const handlePending = (pending: any) => {
+      if (!pending) return
+      if (Date.now() - pending.ts > 120000) return // Expired
+      if (handledRequestIds.current.has(pending.requestId)) return // Already handled
+      if (isHandlingApproval.current) return // User is mid-flow, don't interrupt
+
+      // Check if already connected before showing connect screen
+      if (pending.type === 'connect' && pending.data?.origin) {
+        ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+          const sites: string[] = res['cyberswitch_connected_sites'] || []
+          if (sites.includes(pending.data.origin)) {
+            console.log('[Popup] Skipping — already connected:', pending.data.origin)
+            // Auto-resolve: don't bother the user
+            return
+          }
+          console.log('[Popup Pending]', pending.type, pending.requestId)
+          isHandlingApproval.current = true
           setPendingRequest(pending)
-          if (pending.type === 'connect') setScreen('approveConnect')
-          if (pending.type === 'transaction') setScreen('approveTx')
-          if (pending.type === 'sign') setScreen('approveSign')
-        }
-      })
+          setScreen('approveConnect')
+        })
+        return
+      }
+
+      console.log('[Popup Pending]', pending.type, pending.requestId)
+      isHandlingApproval.current = true
+      setPendingRequest(pending)
+      if (pending.type === 'transaction') setScreen('approveTx')
+      if (pending.type === 'sign') setScreen('approveSign')
     }
 
-    check()
+    // Initial check
+    ch.storage.local.get(['cs_pending'], (res: any) => {
+      handlePending(res['cs_pending'])
+    })
+
+    // Poll briefly on startup (20 × 500ms = 10s)
     let attempts = 0
     const interval = setInterval(() => {
       attempts++
-      check()
-      if (attempts >= 20) clearInterval(interval)
+      if (attempts >= 20 || isHandlingApproval.current) {
+        clearInterval(interval)
+        return
+      }
+      ch.storage.local.get(['cs_pending'], (res: any) => {
+        handlePending(res['cs_pending'])
+      })
     }, 500)
 
-    const ch = (globalThis as any).chrome
-    if (ch?.storage?.onChanged) {
-      const listener = (changes: any) => {
-        if (changes['cs_pending']?.newValue) {
-          const pending = changes['cs_pending'].newValue
-          setPendingRequest(pending)
-          if (pending.type === 'connect') setScreen('approveConnect')
-          if (pending.type === 'transaction') setScreen('approveTx')
-          if (pending.type === 'sign') setScreen('approveSign')
-          clearInterval(interval)
-        }
-      }
-      ch.storage.onChanged.addListener(listener)
-      return () => { clearInterval(interval); ch.storage.onChanged.removeListener(listener) }
+    // Storage change listener
+    const listener = (changes: any) => {
+      if (!changes['cs_pending']?.newValue) return
+      if (isHandlingApproval.current) return // Mid-flow, ignore
+      handlePending(changes['cs_pending'].newValue)
     }
-    return () => clearInterval(interval)
+
+    if (ch?.storage?.onChanged) {
+      ch.storage.onChanged.addListener(listener)
+    }
+
+    return () => {
+      clearInterval(interval)
+      try { ch?.storage?.onChanged?.removeListener(listener) } catch {}
+    }
   }, [])
 
   const refreshDashboard = (address: string) => {
-    getUSDCBalance(address).then(b => { setBalance(b); setBalances(prev => ({ ...prev, [address]: b })) })
+    getUSDCBalance(address).then(b => {
+      setBalance(b)
+      setBalances(prev => ({ ...prev, [address]: b }))
+    })
     getTransactions(address).then(setTransactions)
     setScreen('dashboard')
   }
@@ -182,83 +214,84 @@ export default function Popup() {
     setTimeout(() => setSuccessMsg(''), 4000)
   }
 
-  // ── Send approval response directly to storage ─
+  // ── Send approval response ────────────────────
   const sendApprovalResponse = async (approved: boolean, result?: any) => {
-  if (!pendingRequest) return
+    if (!pendingRequest) return
 
-  const ch = (globalThis as any).chrome
-  if (!ch?.storage?.local) return
+    // Mark as handled IMMEDIATELY — prevents re-processing
+    handledRequestIds.current.add(pendingRequest.requestId)
+    isHandlingApproval.current = false // Release the lock
 
-  const requestId = pendingRequest.requestId
-  const origin = pendingRequest.data?.origin
-  const pendingType = pendingRequest.type
-  const storageKey = `cs_resp_${requestId}`
+    const ch = (globalThis as any).chrome
+    if (!ch?.storage?.local) return
 
-  try {
-    let responsePayload: any
+    const requestId = pendingRequest.requestId
+    const origin = pendingRequest.data?.origin
+    const pendingType = pendingRequest.type
+    const storageKey = `cs_resp_${requestId}`
 
-    if (approved && pendingType === 'connect' && origin) {
-      // Save connected site directly from popup
-      await new Promise<void>((res, rej) => {
-        ch.storage.local.get(['cyberswitch_connected_sites'], (data: any) => {
-          if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
-          const sites: string[] = data['cyberswitch_connected_sites'] || []
-          const updated = sites.includes(origin) ? sites : [...sites, origin]
-          ch.storage.local.set({ cyberswitch_connected_sites: updated }, () => {
+    try {
+      let responsePayload: any
+
+      if (approved && pendingType === 'connect' && origin) {
+        await new Promise<void>((res, rej) => {
+          ch.storage.local.get(['cyberswitch_connected_sites'], (data: any) => {
             if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
-            setConnectedSites(updated)
-            res()
+            const sites: string[] = data['cyberswitch_connected_sites'] || []
+            const updated = sites.includes(origin) ? sites : [...sites, origin]
+            ch.storage.local.set({ cyberswitch_connected_sites: updated }, () => {
+              if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
+              setConnectedSites(updated)
+              res()
+            })
           })
+        })
+        const addresses = wallet?.address ? [wallet.address] : []
+        responsePayload = { result: addresses, error: null, ts: Date.now() }
+
+      } else if (approved) {
+        responsePayload = { result: result ?? null, error: null, ts: Date.now() }
+      } else {
+        responsePayload = {
+          result: null,
+          error: { code: 4001, message: 'User rejected the request' },
+          ts: Date.now()
+        }
+      }
+
+      await new Promise<void>((res, rej) => {
+        ch.storage.local.set({ [storageKey]: responsePayload }, () => {
+          if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
+          res()
         })
       })
 
-      const addresses = wallet?.address ? [wallet.address] : []
-      responsePayload = { result: addresses, error: null, ts: Date.now() }
+      await new Promise(res => setTimeout(res, 300))
+      await new Promise<void>(res => ch.storage.local.remove(['cs_pending'], res))
 
-    } else if (approved) {
-      responsePayload = { result: result ?? null, error: null, ts: Date.now() }
-    } else {
-      responsePayload = {
-        result: null,
-        error: { code: 4001, message: 'User rejected the request' },
-        ts: Date.now()
-      }
+      // Notify background to clear pendingOrigins and resolve duplicates
+      try {
+        ch.runtime.sendMessage({
+          type: 'CYBERSWITCH_APPROVAL_RESPONSE',
+          payload: { requestId, approved, origin, result, pendingType }
+        })
+      } catch {}
+
+    } catch (e) {
+      try {
+        await new Promise<void>(res => {
+          ch.storage.local.set({
+            [storageKey]: { result: null, error: { code: -32603, message: 'Internal error' }, ts: Date.now() }
+          }, res)
+        })
+      } catch {}
     }
 
-    // Write response to storage
-    await new Promise<void>((res, rej) => {
-      ch.storage.local.set({ [storageKey]: responsePayload }, () => {
-        if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
-        res()
-      })
-    })
-
-    await new Promise(res => setTimeout(res, 300))
-    await new Promise<void>(res => ch.storage.local.remove(['cs_pending'], res))
-
-    // Notify background to clear pendingOrigins
-    try {
-      ch.runtime.sendMessage({
-        type: 'CYBERSWITCH_APPROVAL_RESPONSE',
-        payload: { requestId, approved, origin, result, pendingType }
-      })
-    } catch {}
-
-  } catch (e) {
-    try {
-      await new Promise<void>(res => {
-        ch.storage.local.set({
-          [storageKey]: { result: null, error: { code: -32603, message: 'Internal error' }, ts: Date.now() }
-        }, res)
-      })
-    } catch {}
+    setPendingRequest(null)
+    setSignToConnectPending(null)
+    setSignLoading(false)
+    setScreen('dashboard')
   }
-
-  setPendingRequest(null)
-  setSignToConnectPending(null)
-  setSignLoading(false)
-  setScreen('dashboard')
-}
 
   const generateQR = async (address: string) => {
     try {
@@ -811,9 +844,8 @@ export default function Popup() {
             </div>
           ))}
         </div>
-        <p style={s.bodyText}>This site is requesting access to your wallet address. It cannot move funds without your explicit approval.</p>
+        <p style={s.bodyText}>This site is requesting access to your wallet address. It cannot move funds without explicit approval.</p>
         <button style={s.btnPrimary} onClick={() => {
-          // Move to sign step for 2FA
           setSignToConnectPending(pendingRequest)
           setScreen('signToConnect')
         }}>Review & Sign →</button>
@@ -823,7 +855,7 @@ export default function Popup() {
     </div>
   )
 
-  // ── Sign to Connect (2FA step) ────────────────
+  // ── Sign to Connect (2FA) ─────────────────────
   if (screen === 'signToConnect' && signToConnectPending) {
     const origin = signToConnectPending.data?.origin || ''
     const signMessage = `CyberSwitch Wallet Authentication\n\nSite: ${origin}\nWallet: ${wallet?.address}\nTimestamp: ${new Date().toISOString()}\n\nBy signing this message you authorize CyberSwitch to connect your wallet to this site. This does not grant permission to move funds.`
@@ -836,37 +868,35 @@ export default function Popup() {
             ✍️ Sign to Confirm
           </div>
           <h2 style={s.sectionTitle}>Authorize Connection</h2>
-          <p style={s.bodyText}>Sign this message to prove wallet ownership and complete the connection. This is a security step — no funds will move.</p>
+          <p style={s.bodyText}>Sign this message to prove wallet ownership. No funds will move.</p>
           <div style={s.txDetailCard}>
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Site</span>
-              <span style={{ ...s.txDetailValue, color: '#4d8aff', wordBreak: 'break-all' }}>{origin}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Wallet</span>
-              <span style={s.txDetailValue}>{wallet?.name}</span>
-            </div>
-            <div style={s.txDetailDivider} />
-            <div style={s.txDetailRow}>
-              <span style={s.txDetailLabel}>Network</span>
-              <span style={{ ...s.txDetailValue, color: '#10b981' }}>Arc Testnet</span>
-            </div>
+            {[
+              ['Site', origin, '#4d8aff'],
+              ['Wallet', wallet?.name || '', '#fff'],
+              ['Network', 'Arc Testnet', '#10b981'],
+            ].map(([label, value, color], i) => (
+              <div key={i}>
+                {i > 0 && <div style={s.txDetailDivider} />}
+                <div style={s.txDetailRow}>
+                  <span style={s.txDetailLabel}>{label}</span>
+                  <span style={{ ...s.txDetailValue, color: color as string, wordBreak: 'break-all' }}>{value}</span>
+                </div>
+              </div>
+            ))}
           </div>
-          <div style={{ ...s.mnemonicBox, maxHeight: 110, overflowY: 'auto' }}>
-            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>MESSAGE TO SIGN</p>
-            <p style={{ margin: 0, fontSize: 11, color: '#93b4ff', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>{signMessage}</p>
+          <div style={{ ...s.mnemonicBox, maxHeight: 100, overflowY: 'auto' }}>
+            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde' }}>MESSAGE TO SIGN</p>
+            <p style={{ margin: 0, fontSize: 11, color: '#93b4ff', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>{signMessage}</p>
           </div>
           {error && <p style={s.error}>{error}</p>}
           <button style={{ ...s.btnPrimary, opacity: signLoading ? 0.7 : 1 }}
             onClick={async () => {
               if (!wallet || signLoading) return
-              setSignLoading(true)
-              setError('')
+              setSignLoading(true); setError('')
               try {
                 const { ethers } = await import('ethers')
                 const signer = new ethers.Wallet(wallet.privateKey)
-                await signer.signMessage(signMessage) // Sign for proof
+                await signer.signMessage(signMessage)
                 await sendApprovalResponse(true)
                 showSuccess('✓ Connected successfully!')
               } catch (e: any) {
@@ -877,11 +907,9 @@ export default function Popup() {
             {signLoading ? 'Signing...' : '✍️ Sign & Connect'}
           </button>
           <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
-            onClick={() => {
-              sendApprovalResponse(false)
-              setSignToConnectPending(null)
-            }}>Reject</button>
+            onClick={() => { sendApprovalResponse(false); setSignToConnectPending(null) }}>Reject</button>
           <button style={s.btnGhost} onClick={() => {
+            isHandlingApproval.current = true // Keep lock while going back
             setSignToConnectPending(null)
             setScreen('approveConnect')
           }}>← Back</button>
@@ -971,7 +999,7 @@ export default function Popup() {
             <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde' }}>MESSAGE</p>
             <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, wordBreak: 'break-all' }}>{decodedMsg}</p>
           </div>
-          <p style={{ ...s.bodyText, fontSize: 11 }}>⚠️ Only sign from trusted sites. This proves your identity but does not send funds.</p>
+          <p style={{ ...s.bodyText, fontSize: 11 }}>⚠️ Only sign from trusted sites. This proves identity but does not send funds.</p>
           {signatureResult ? (
             <>
               <div style={s.addressBox}>{signatureResult}</div>
@@ -1023,10 +1051,8 @@ export default function Popup() {
           </div>
         </div>
 
-        {/* Connection status indicator */}
-        <div
-          style={s.connectionBar}
-          onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
+        {/* Connection status bar */}
+        <div style={s.connectionBar} onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <div style={{
               width: 8, height: 8, borderRadius: '50%',
