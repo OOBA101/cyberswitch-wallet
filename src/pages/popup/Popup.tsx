@@ -13,8 +13,8 @@ import { getUSDCBalance, sendUSDC, getTransactions } from '../../utils/arc'
 type Screen = 'loading' | 'locked' | 'setPassword' | 'welcome' | 'showPhrase' |
   'import' | 'dashboard' | 'send' | 'receive' | 'settings' | 'addWallet' |
   'addShowPhrase' | 'addImport' | 'confirmDelete' | 'revealPhrase' |
-  'walletSwitcher' | 'txDetail' | 'approveConnect' | 'approveTx' |
-  'approveSign' | 'changePassword' | 'connectedSites'
+  'walletSwitcher' | 'txDetail' | 'approveConnect' | 'signToConnect' |
+  'approveTx' | 'approveSign' | 'changePassword' | 'connectedSites'
 
 const CyberSwitchLogo = ({ size = 40, opacity = 1 }: { size?: number; opacity?: number }) => {
   const arc = (startDeg: number, endDeg: number, R = 46, r = 20) => {
@@ -67,11 +67,18 @@ export default function Popup() {
   const [passwordConfirm, setPasswordConfirm] = useState('')
   const [connectedSites, setConnectedSites] = useState<string[]>([])
   const [signatureResult, setSignatureResult] = useState('')
+  const [connectedToCurrentSite, setConnectedToCurrentSite] = useState<boolean>(false)
+  const [currentTabOrigin, setCurrentTabOrigin] = useState('')
+  const [signToConnectPending, setSignToConnectPending] = useState<any>(null)
+  const [signLoading, setSignLoading] = useState(false)
 
   const wallet = wallets[activeIndex] || null
 
   // ── Init ──────────────────────────────────────
   useEffect(() => {
+    // Clear badge when popup opens
+    const ch2 = (globalThis as any).chrome
+      if (ch2?.action) ch2.action.setBadgeText({ text: '' })
     const init = async () => {
       try {
         const [ws, idx, hasPwd] = await Promise.all([
@@ -96,6 +103,26 @@ export default function Popup() {
     init()
   }, [])
 
+  // ── Check connection status for current tab ───
+  useEffect(() => {
+    const checkTabConnection = () => {
+      const ch = (globalThis as any).chrome
+      if (!ch?.tabs || !ch?.storage?.local) return
+      ch.tabs.query({ active: true, currentWindow: true }, (tabs: any[]) => {
+        if (!tabs[0]?.url) return
+        try {
+          const origin = new URL(tabs[0].url).origin
+          setCurrentTabOrigin(origin)
+          ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
+            const sites: string[] = res['cyberswitch_connected_sites'] || []
+            setConnectedToCurrentSite(sites.includes(origin))
+          })
+        } catch {}
+      })
+    }
+    checkTabConnection()
+  }, [screen, connectedSites])
+
   // ── Check pending approvals ───────────────────
   useEffect(() => {
     const check = () => {
@@ -104,7 +131,6 @@ export default function Popup() {
       ch.storage.local.get(['cs_pending'], (res: any) => {
         const pending = res['cs_pending']
         if (pending && Date.now() - pending.ts < 120000) {
-          console.log('Found pending request:', pending.type, pending.requestId)
           setPendingRequest(pending)
           if (pending.type === 'connect') setScreen('approveConnect')
           if (pending.type === 'transaction') setScreen('approveTx')
@@ -126,7 +152,6 @@ export default function Popup() {
       const listener = (changes: any) => {
         if (changes['cs_pending']?.newValue) {
           const pending = changes['cs_pending'].newValue
-          console.log('Storage changed - new pending:', pending.type, pending.requestId)
           setPendingRequest(pending)
           if (pending.type === 'connect') setScreen('approveConnect')
           if (pending.type === 'transaction') setScreen('approveTx')
@@ -157,30 +182,23 @@ export default function Popup() {
     setTimeout(() => setSuccessMsg(''), 4000)
   }
 
-  // ── KEY FIX: Write directly to storage ───────
+  // ── Send approval response directly to storage ─
   const sendApprovalResponse = async (approved: boolean, result?: any) => {
-  console.log('[CyberSwitch Popup] sendApprovalResponse:', { approved, type: pendingRequest?.type, requestId: pendingRequest?.requestId })
-
-  if (!pendingRequest) {
-    console.error('[CyberSwitch Popup] No pending request!')
-    return
-  }
+  if (!pendingRequest) return
 
   const ch = (globalThis as any).chrome
-  if (!ch?.storage?.local) {
-    console.error('[CyberSwitch Popup] No chrome storage!')
-    return
-  }
+  if (!ch?.storage?.local) return
 
   const requestId = pendingRequest.requestId
   const origin = pendingRequest.data?.origin
+  const pendingType = pendingRequest.type
   const storageKey = `cs_resp_${requestId}`
 
   try {
     let responsePayload: any
 
-    if (approved && requestId.startsWith('connect_') && origin) {
-      // Step 1: Add site to connected list
+    if (approved && pendingType === 'connect' && origin) {
+      // Save connected site directly from popup
       await new Promise<void>((res, rej) => {
         ch.storage.local.get(['cyberswitch_connected_sites'], (data: any) => {
           if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
@@ -188,20 +206,13 @@ export default function Popup() {
           const updated = sites.includes(origin) ? sites : [...sites, origin]
           ch.storage.local.set({ cyberswitch_connected_sites: updated }, () => {
             if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
-            console.log('[CyberSwitch Popup] Site saved:', origin)
+            setConnectedSites(updated)
             res()
           })
         })
       })
 
-      // Get wallet address (stored plaintext)
-  // Read address directly using wallets already in React state
-const addresses: string[] = wallet?.address ? [wallet.address] : []
-console.log('[CyberSwitch Popup] Using wallet from state:', addresses)
-
-console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
-
-      console.log('[CyberSwitch Popup] Resolving with addresses:', addresses)
+      const addresses = wallet?.address ? [wallet.address] : []
       responsePayload = { result: addresses, error: null, ts: Date.now() }
 
     } else if (approved) {
@@ -214,26 +225,26 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
       }
     }
 
-    // Write response — await confirmation
+    // Write response to storage
     await new Promise<void>((res, rej) => {
       ch.storage.local.set({ [storageKey]: responsePayload }, () => {
         if (ch.runtime.lastError) { rej(new Error(ch.runtime.lastError.message)); return }
-        console.log('[CyberSwitch Popup] ✅ Response written to storage:', storageKey, responsePayload)
         res()
       })
     })
 
-    // Small delay to ensure content script picks up before popup state changes
     await new Promise(res => setTimeout(res, 300))
-
-    // Clean up pending
     await new Promise<void>(res => ch.storage.local.remove(['cs_pending'], res))
 
-    console.log('[CyberSwitch Popup] Flow complete ✅')
+    // Notify background to clear pendingOrigins
+    try {
+      ch.runtime.sendMessage({
+        type: 'CYBERSWITCH_APPROVAL_RESPONSE',
+        payload: { requestId, approved, origin, result, pendingType }
+      })
+    } catch {}
 
   } catch (e) {
-    console.error('[CyberSwitch Popup] sendApprovalResponse error:', e)
-    // Write error response so content script doesn't hang
     try {
       await new Promise<void>(res => {
         ch.storage.local.set({
@@ -244,6 +255,8 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
   }
 
   setPendingRequest(null)
+  setSignToConnectPending(null)
+  setSignLoading(false)
   setScreen('dashboard')
 }
 
@@ -282,7 +295,10 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
     if (ch?.storage?.local) {
       ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
         const sites = (res['cyberswitch_connected_sites'] || []).filter((s: string) => s !== origin)
-        ch.storage.local.set({ cyberswitch_connected_sites: sites }, () => setConnectedSites(sites))
+        ch.storage.local.set({ cyberswitch_connected_sites: sites }, () => {
+          setConnectedSites(sites)
+          if (origin === currentTabOrigin) setConnectedToCurrentSite(false)
+        })
       })
     }
   }
@@ -304,8 +320,11 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
             onKeyDown={async e => {
               if (e.key !== 'Enter') return
               const ok = await verifyPassword(passwordInput)
-              if (ok) { setPasswordInput(''); setError(''); const ws = await loadWallets(); setWallets(ws); refreshDashboard(ws[activeIndex]?.address || ws[0]?.address) }
-              else setError('Incorrect password')
+              if (ok) {
+                setPasswordInput(''); setError('')
+                const ws = await loadWallets(); setWallets(ws)
+                refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
+              } else setError('Incorrect password')
             }} />
         </div>
         {error && <p style={s.error}>{error}</p>}
@@ -313,8 +332,7 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
           const ok = await verifyPassword(passwordInput)
           if (ok) {
             setPasswordInput(''); setError('')
-            const ws = await loadWallets()
-            setWallets(ws)
+            const ws = await loadWallets(); setWallets(ws)
             refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
           } else setError('Incorrect password')
         }}>Unlock</button>
@@ -696,7 +714,12 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
           ? <div style={s.txEmpty}><p style={s.muted}>No sites connected yet</p></div>
           : connectedSites.map((site, i) => (
             <div key={i} style={{ ...s.settingsItem, padding: '12px 16px' }}>
-              <p style={{ ...s.settingsTitle, fontSize: 12, margin: 0 }}>{site}</p>
+              <div>
+                <p style={{ ...s.settingsTitle, fontSize: 12, margin: 0 }}>{site}</p>
+                {site === currentTabOrigin && (
+                  <p style={{ margin: '2px 0 0', fontSize: 10, color: '#10b981' }}>● Current tab</p>
+                )}
+              </div>
               <button style={{ background: 'rgba(248,113,113,0.15)', color: '#f87171', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
                 onClick={() => disconnectSite(site)}>Disconnect</button>
             </div>
@@ -719,7 +742,7 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
           <>
             <div style={{ ...s.mnemonicBox, borderColor: 'rgba(251,191,36,0.3)', background: 'rgba(251,191,36,0.05)' }}>
               <p style={{ margin: '0 0 8px', fontSize: 16 }}>⚠️ Security Warning</p>
-              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>Never share your recovery phrase. Not even with CyberSwitch support.</p>
+              <p style={{ margin: 0, fontSize: 12, color: '#fbbf24', lineHeight: 1.7 }}>Never share your recovery phrase with anyone — not even CyberSwitch support.</p>
             </div>
             <button style={s.btnPrimary} onClick={() => setPhraseRevealed(true)}>I Understand — Reveal Phrase</button>
             <button style={s.btnGhost} onClick={() => setScreen('settings')}>← Back</button>
@@ -788,13 +811,84 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
             </div>
           ))}
         </div>
-        <p style={s.bodyText}>This site wants access to your wallet address. It cannot move funds without approval.</p>
-        <button style={s.btnPrimary} onClick={() => sendApprovalResponse(true)}>Connect Wallet</button>
+        <p style={s.bodyText}>This site is requesting access to your wallet address. It cannot move funds without your explicit approval.</p>
+        <button style={s.btnPrimary} onClick={() => {
+          // Move to sign step for 2FA
+          setSignToConnectPending(pendingRequest)
+          setScreen('signToConnect')
+        }}>Review & Sign →</button>
         <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
           onClick={() => sendApprovalResponse(false)}>Reject</button>
       </div>
     </div>
   )
+
+  // ── Sign to Connect (2FA step) ────────────────
+  if (screen === 'signToConnect' && signToConnectPending) {
+    const origin = signToConnectPending.data?.origin || ''
+    const signMessage = `CyberSwitch Wallet Authentication\n\nSite: ${origin}\nWallet: ${wallet?.address}\nTimestamp: ${new Date().toISOString()}\n\nBy signing this message you authorize CyberSwitch to connect your wallet to this site. This does not grant permission to move funds.`
+
+    return (
+      <div style={s.page}>
+        <WatermarkBg />
+        <div style={s.content}>
+          <div style={{ ...s.successBadge, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', border: '1px solid rgba(139,92,246,0.3)' }}>
+            ✍️ Sign to Confirm
+          </div>
+          <h2 style={s.sectionTitle}>Authorize Connection</h2>
+          <p style={s.bodyText}>Sign this message to prove wallet ownership and complete the connection. This is a security step — no funds will move.</p>
+          <div style={s.txDetailCard}>
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Site</span>
+              <span style={{ ...s.txDetailValue, color: '#4d8aff', wordBreak: 'break-all' }}>{origin}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Wallet</span>
+              <span style={s.txDetailValue}>{wallet?.name}</span>
+            </div>
+            <div style={s.txDetailDivider} />
+            <div style={s.txDetailRow}>
+              <span style={s.txDetailLabel}>Network</span>
+              <span style={{ ...s.txDetailValue, color: '#10b981' }}>Arc Testnet</span>
+            </div>
+          </div>
+          <div style={{ ...s.mnemonicBox, maxHeight: 110, overflowY: 'auto' }}>
+            <p style={{ margin: '0 0 6px', fontSize: 11, color: '#7b8cde', letterSpacing: 0.4 }}>MESSAGE TO SIGN</p>
+            <p style={{ margin: 0, fontSize: 11, color: '#93b4ff', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>{signMessage}</p>
+          </div>
+          {error && <p style={s.error}>{error}</p>}
+          <button style={{ ...s.btnPrimary, opacity: signLoading ? 0.7 : 1 }}
+            onClick={async () => {
+              if (!wallet || signLoading) return
+              setSignLoading(true)
+              setError('')
+              try {
+                const { ethers } = await import('ethers')
+                const signer = new ethers.Wallet(wallet.privateKey)
+                await signer.signMessage(signMessage) // Sign for proof
+                await sendApprovalResponse(true)
+                showSuccess('✓ Connected successfully!')
+              } catch (e: any) {
+                setError(e?.message || 'Signing failed')
+                setSignLoading(false)
+              }
+            }}>
+            {signLoading ? 'Signing...' : '✍️ Sign & Connect'}
+          </button>
+          <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
+            onClick={() => {
+              sendApprovalResponse(false)
+              setSignToConnectPending(null)
+            }}>Reject</button>
+          <button style={s.btnGhost} onClick={() => {
+            setSignToConnectPending(null)
+            setScreen('approveConnect')
+          }}>← Back</button>
+        </div>
+      </div>
+    )
+  }
 
   // ── Approve Transaction ───────────────────────
   if (screen === 'approveTx' && pendingRequest) {
@@ -819,12 +913,12 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
               ['To', `${tx.to?.slice(0, 10)}...${tx.to?.slice(-6)}`, '#fff'],
               ['Site', pendingRequest.data?.origin, '#4d8aff'],
               ['Network', 'Arc Testnet', '#10b981'],
-            ].map(([label, value, color], i) => (
+            ].map(([label, val, color], i) => (
               <div key={i}>
                 {i > 0 && <div style={s.txDetailDivider} />}
                 <div style={s.txDetailRow}>
                   <span style={s.txDetailLabel}>{label}</span>
-                  <span style={{ ...s.txDetailValue, color: color as string, wordBreak: 'break-all' }}>{value}</span>
+                  <span style={{ ...s.txDetailValue, color: color as string, wordBreak: 'break-all' }}>{val}</span>
                 </div>
               </div>
             ))}
@@ -928,6 +1022,25 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
             <button style={s.settingsBtn} onClick={() => setScreen('settings')}>⚙</button>
           </div>
         </div>
+
+        {/* Connection status indicator */}
+        <div
+          style={s.connectionBar}
+          onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: connectedToCurrentSite ? '#10b981' : '#f87171',
+              boxShadow: connectedToCurrentSite ? '0 0 6px rgba(16,185,129,0.6)' : '0 0 6px rgba(248,113,113,0.6)',
+              flexShrink: 0,
+            }} />
+            <span style={{ fontSize: 11, color: connectedToCurrentSite ? '#10b981' : '#f87171', fontWeight: 600 }}>
+              {connectedToCurrentSite ? 'Connected to this site' : 'Not connected'}
+            </span>
+          </div>
+          <span style={{ fontSize: 10, color: '#4a5580' }}>Manage →</span>
+        </div>
+
         <div style={s.addressPill}>{wallet?.address.slice(0, 8)}...{wallet?.address.slice(-6)}</div>
         <div style={s.balanceCard}>
           <p style={s.balanceLabel}>Total Balance</p>
@@ -982,7 +1095,7 @@ console.log('[CyberSwitch Popup] Resolved addresses:', addresses)
 
 const s: Record<string, React.CSSProperties> = {
   page: { width: 380, height: 600, background: 'linear-gradient(160deg, #04041e 0%, #060d3a 60%, #04041e 100%)', color: '#fff', fontFamily: "'Inter', sans-serif", position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' },
-  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 14, padding: 24, flex: 1, overflowY: 'auto', maxHeight: '600px' },
+  content: { position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column', gap: 12, padding: 20, flex: 1, overflowY: 'auto', maxHeight: '600px' },
   center: { display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1 },
   logoRow: { display: 'flex', alignItems: 'center', gap: 12 },
   brandName: { fontSize: 17, fontWeight: 700, margin: 0, letterSpacing: 0.3 },
@@ -1013,19 +1126,20 @@ const s: Record<string, React.CSSProperties> = {
   qrPlaceholder: { background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 16, height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   qrInner: { display: 'flex', flexDirection: 'column', alignItems: 'center' },
   dashHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  connectionBar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 10, padding: '8px 14px', cursor: 'pointer' },
   networkPill: { display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 20, padding: '5px 12px', fontSize: 11, color: '#7b8cde' },
   dot: { width: 6, height: 6, borderRadius: '50%', background: '#10b981', display: 'inline-block' },
   networkRow: { display: 'flex', alignItems: 'center', gap: 8 },
   networkLabel: { fontSize: 12, color: '#7b8cde' },
   addressPill: { background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 20, padding: '6px 16px', fontSize: 12, color: '#7b8cde', alignSelf: 'center' },
-  balanceCard: { background: 'linear-gradient(135deg, rgba(26,58,255,0.2), rgba(0,102,255,0.1))', border: '1px solid rgba(26,58,255,0.25)', borderRadius: 16, padding: '24px 20px', textAlign: 'center' },
+  balanceCard: { background: 'linear-gradient(135deg, rgba(26,58,255,0.2), rgba(0,102,255,0.1))', border: '1px solid rgba(26,58,255,0.25)', borderRadius: 16, padding: '20px', textAlign: 'center' },
   balanceLabel: { fontSize: 12, color: '#7b8cde', margin: '0 0 6px', letterSpacing: 0.5, textTransform: 'uppercase' },
   balanceAmount: { fontSize: 40, fontWeight: 800, margin: 0, letterSpacing: -1 },
   balanceCurrency: { fontSize: 14, color: '#4d8aff', margin: '2px 0 12px', fontWeight: 600 },
   balanceDivider: { height: 1, background: 'rgba(255,255,255,0.07)', margin: '0 0 10px' },
   balanceSub: { fontSize: 12, color: '#4a5580', margin: 0 },
   actionRow: { display: 'flex', gap: 10 },
-  actionBtn: { flex: 1, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 12, padding: '14px 0', color: '#fff', fontWeight: 600, fontSize: 13, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 },
+  actionBtn: { flex: 1, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 12, padding: '12px 0', color: '#fff', fontWeight: 600, fontSize: 13, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 },
   actionIcon: { fontSize: 18, color: '#4d8aff' },
   settingsBtn: { background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)', color: '#7b8cde', borderRadius: 8, width: 32, height: 32, cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   settingsItem: { background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, padding: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' },

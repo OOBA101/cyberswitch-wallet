@@ -23,10 +23,11 @@
     }
   ],
   "permissions": [
-    "storage",
-    "activeTab",
-    "tabs",
-    "windows"
+  "storage",
+  "activeTab",
+  "tabs",
+  "windows",
+  "alarms"
   ],
   "host_permissions": [
     "<all_urls>"

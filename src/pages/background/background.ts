@@ -1,14 +1,19 @@
-// Keep service worker alive
-const keepAlive = () => setInterval(chrome.runtime.getPlatformInfo, 20000)
-chrome.runtime.onStartup.addListener(keepAlive)
-chrome.runtime.onInstalled.addListener(keepAlive)
-keepAlive()
-
 const WALLETS_KEY = 'cyberswitch_wallets'
 const ACTIVE_KEY = 'cyberswitch_active'
 const CONNECTED_SITES_KEY = 'cyberswitch_connected_sites'
 const ARC_CHAIN_ID = '0x4CE052'
 const ARC_RPC = 'https://rpc.testnet.arc.network'
+
+console.log('[CyberSwitch Background Started]', new Date().toISOString())
+
+chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'keepAlive') chrome.runtime.getPlatformInfo(() => {})
+})
+
+chrome.runtime.onSuspend.addListener(() => {
+  console.log('[CyberSwitch] Worker suspending')
+})
 
 const storage = {
   get: (key: string): Promise<any> =>
@@ -28,9 +33,63 @@ const storage = {
     }),
 }
 
+// ── Encode origin for use as storage key ──────
+const encodeOrigin = (origin: string) =>
+  origin.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60)
+
+// ── Pending request tracking (storage-based) ──
+const getPendingReqsKey = (origin: string) =>
+  `cs_pending_reqs_${encodeOrigin(origin)}`
+
+const addPendingReqId = async (origin: string, requestId: string): Promise<void> => {
+  const key = getPendingReqsKey(origin)
+  const existing: string[] = (await storage.get(key)) || []
+  if (!existing.includes(requestId)) {
+    await storage.set(key, [...existing, requestId])
+  }
+}
+
+const getPendingReqIds = async (origin: string): Promise<string[]> => {
+  return (await storage.get(getPendingReqsKey(origin))) || []
+}
+
+const clearPendingReqIds = async (origin: string): Promise<void> => {
+  await storage.remove(getPendingReqsKey(origin))
+}
+
+const isOriginPending = async (origin: string): Promise<boolean> => {
+  const reqs = await getPendingReqIds(origin)
+  return reqs.length > 0
+}
+
+// ── Just-approved cache — survives race conditions ──
+const getJustApprovedKey = (origin: string) =>
+  `cs_just_approved_${encodeOrigin(origin)}`
+
+const markJustApproved = async (origin: string, address: string): Promise<void> => {
+  await storage.set(getJustApprovedKey(origin), {
+    address,
+    ts: Date.now()
+  })
+}
+
+const getJustApproved = async (origin: string): Promise<string | null> => {
+  const val = await storage.get(getJustApprovedKey(origin))
+  if (!val || (Date.now() - val.ts) > 60000) return null // 60 second window
+  return val.address
+}
+
+const clearJustApproved = async (origin: string): Promise<void> => {
+  await storage.remove(getJustApprovedKey(origin))
+}
+
+// ── Wallet helpers ────────────────────────────
 const getActiveWallet = async () => {
   try {
-    const [wallets, idx] = await Promise.all([storage.get(WALLETS_KEY), storage.get(ACTIVE_KEY)])
+    const [wallets, idx] = await Promise.all([
+      storage.get(WALLETS_KEY),
+      storage.get(ACTIVE_KEY)
+    ])
     if (!wallets?.length) return null
     return wallets[Math.min(idx ?? 0, wallets.length - 1)]
   } catch { return null }
@@ -44,7 +103,9 @@ const getConnectedSites = async (): Promise<string[]> => {
 const addConnectedSite = async (origin: string) => {
   try {
     const sites = await getConnectedSites()
-    if (!sites.includes(origin)) await storage.set(CONNECTED_SITES_KEY, [...sites, origin])
+    if (!sites.includes(origin)) {
+      await storage.set(CONNECTED_SITES_KEY, [...sites, origin])
+    }
   } catch {}
 }
 
@@ -53,6 +114,26 @@ const removeConnectedSite = async (origin: string) => {
     const sites = await getConnectedSites()
     await storage.set(CONNECTED_SITES_KEY, sites.filter((s: string) => s !== origin))
   } catch {}
+}
+
+// ── Resolve ALL pending requests for an origin ─
+const resolveAllPendingReqs = async (
+  origin: string,
+  result: any,
+  error: any = null
+): Promise<void> => {
+  const reqIds = await getPendingReqIds(origin)
+  console.log('[CyberSwitch] Resolving', reqIds.length, 'pending requests for', origin)
+  await Promise.all(
+    reqIds.map(reqId =>
+      storage.set(`cs_resp_${reqId}`, {
+        result: error ? null : result,
+        error,
+        ts: Date.now()
+      })
+    )
+  )
+  await clearPendingReqIds(origin)
 }
 
 const rpcCall = async (method: string, params: any[] = []) => {
@@ -67,58 +148,117 @@ const rpcCall = async (method: string, params: any[] = []) => {
 }
 
 const openPopup = async () => {
-  return new Promise<void>((resolve) => {
-    chrome.windows.create({
-      url: chrome.runtime.getURL('index.html'),
-      type: 'popup',
-      width: 400,
-      height: 640,
-      focused: true,
-    }, () => resolve())
-  })
+  try {
+    await (chrome.action as any).openPopup()
+    chrome.action.setBadgeText({ text: '' })
+  } catch {
+    chrome.action.setBadgeText({ text: '!' })
+    chrome.action.setBadgeBackgroundColor({ color: '#f87171' })
+  }
 }
 
+setInterval(() => {
+  chrome.storage.local.get(null, (res: any) => {
+    const stale = Object.keys(res).filter(k =>
+      k.startsWith('cs_resp_') && res[k]?.ts && (Date.now() - res[k].ts) > 300000
+    )
+    if (stale.length) chrome.storage.local.remove(stale)
+  })
+}, 300000)
+
+// ── Provider request handler ──────────────────
 const handleProviderRequest = async (request: any, origin: string): Promise<any> => {
   const { method, params, requestId } = request
+
   switch (method) {
     case 'eth_chainId': return ARC_CHAIN_ID
     case 'net_version': return '5042002'
+
     case 'eth_accounts': {
       const sites = await getConnectedSites()
-      if (!sites.includes(origin)) return []
+      if (!sites.includes(origin)) {
+        // Also check just-approved cache
+        const justApprovedAddr = await getJustApproved(origin)
+        if (justApprovedAddr) return [justApprovedAddr]
+        return []
+      }
       const wallet = await getActiveWallet()
       return wallet ? [wallet.address] : []
     }
+
     case 'eth_requestAccounts': {
+      // Check connected sites
       const sites = await getConnectedSites()
       if (sites.includes(origin)) {
         const wallet = await getActiveWallet()
+        console.log('[CyberSwitch] Already connected:', origin)
         return wallet ? [wallet.address] : []
       }
-      await storage.set('cs_pending', { type: 'connect', data: { origin }, requestId, ts: Date.now() })
+
+      // Check just-approved cache (handles race condition)
+      const justApprovedAddr = await getJustApproved(origin)
+      if (justApprovedAddr) {
+        console.log('[CyberSwitch] Just approved (fast path):', origin)
+        return [justApprovedAddr]
+      }
+
+      const alreadyPending = await isOriginPending(origin)
+
+      // Always register this requestId so it gets resolved on approval
+      await addPendingReqId(origin, requestId)
+
+      if (alreadyPending) {
+        console.log('[CyberSwitch] Duplicate queued for:', origin, requestId)
+        return 'PENDING'
+      }
+
+      // First request — write pending and open popup
+      await storage.set('cs_pending', {
+        type: 'connect',
+        data: { origin },
+        requestId,
+        ts: Date.now(),
+      })
+
+      console.log('[CyberSwitch] Opening popup for connect:', origin)
       await openPopup()
       return 'PENDING'
     }
+
     case 'eth_sendTransaction': {
       const sites = await getConnectedSites()
       if (!sites.includes(origin)) throw { code: 4100, message: 'Connect first.' }
-      await storage.set('cs_pending', { type: 'transaction', data: { origin, txParams: params?.[0] }, requestId, ts: Date.now() })
+      await storage.set('cs_pending', {
+        type: 'transaction',
+        data: { origin, txParams: params?.[0] },
+        requestId,
+        ts: Date.now(),
+      })
       await openPopup()
       return 'PENDING'
     }
+
     case 'eth_sign':
     case 'personal_sign': {
       const sites = await getConnectedSites()
       if (!sites.includes(origin)) throw { code: 4100, message: 'Connect first.' }
       const message = method === 'personal_sign' ? params?.[0] : params?.[1]
-      await storage.set('cs_pending', { type: 'sign', data: { origin, message }, requestId, ts: Date.now() })
+      await storage.set('cs_pending', {
+        type: 'sign',
+        data: { origin, message },
+        requestId,
+        ts: Date.now(),
+      })
       await openPopup()
       return 'PENDING'
     }
+
     case 'wallet_switchEthereumChain':
     case 'wallet_addEthereumChain':
-      if (params?.[0]?.chainId !== ARC_CHAIN_ID) throw { code: 4902, message: 'CyberSwitch only supports Arc Testnet.' }
+      if (params?.[0]?.chainId !== ARC_CHAIN_ID)
+        throw { code: 4902, message: 'CyberSwitch only supports Arc Testnet.' }
       return null
+
     case 'eth_getBalance': return rpcCall('eth_getBalance', params)
     case 'eth_blockNumber': return rpcCall('eth_blockNumber', [])
     case 'eth_getTransactionByHash': return rpcCall('eth_getTransactionByHash', params)
@@ -126,8 +266,15 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
     case 'eth_call': return rpcCall('eth_call', params)
     case 'eth_estimateGas': return rpcCall('eth_estimateGas', params)
     case 'eth_gasPrice': return rpcCall('eth_gasPrice', [])
-    case 'wallet_disconnect': await removeConnectedSite(origin); return null
-    default: throw { code: -32601, message: `Method ${method} not supported` }
+
+    case 'wallet_disconnect':
+      await removeConnectedSite(origin)
+      await clearPendingReqIds(origin)
+      await clearJustApproved(origin)
+      return null
+
+    default:
+      throw { code: -32601, message: `Method ${method} not supported` }
   }
 }
 
@@ -135,44 +282,93 @@ chrome.runtime.onMessage.addListener((message: any, sender: any, sendResponse: a
   const { type, payload } = message
 
   if (type === 'CYBERSWITCH_APPROVAL_RESPONSE') {
-    const { requestId, approved, origin, result } = payload
+    const { approved, origin, pendingType, result } = payload
+
     const handle = async () => {
       try {
-        if (approved && requestId.startsWith('connect_') && origin) {
+        if (approved && pendingType === 'connect' && origin) {
           await addConnectedSite(origin)
           const wallet = await getActiveWallet()
-          await storage.set(`cs_resp_${requestId}`, { result: wallet ? [wallet.address] : [], error: null, ts: Date.now() })
+          const addresses = wallet ? [wallet.address] : []
+
+          // Write just-approved cache immediately
+          if (wallet?.address) await markJustApproved(origin, wallet.address)
+
+          // Resolve all queued requests for this origin
+          await resolveAllPendingReqs(origin, addresses)
+
         } else if (approved) {
-          await storage.set(`cs_resp_${requestId}`, { result: result ?? null, error: null, ts: Date.now() })
+          const { requestId } = payload
+          await storage.set(`cs_resp_${requestId}`, {
+            result: result ?? null, error: null, ts: Date.now()
+          })
         } else {
-          await storage.set(`cs_resp_${requestId}`, { result: null, error: { code: 4001, message: 'User rejected the request' }, ts: Date.now() })
+          if (origin && pendingType === 'connect') {
+            await resolveAllPendingReqs(origin, null, {
+              code: 4001, message: 'User rejected the request'
+            })
+          } else {
+            const { requestId } = payload
+            await storage.set(`cs_resp_${requestId}`, {
+              result: null,
+              error: { code: 4001, message: 'User rejected the request' },
+              ts: Date.now()
+            })
+          }
         }
+
         await storage.remove('cs_pending')
+        chrome.action.setBadgeText({ text: '' })
+        console.log('[CyberSwitch] Approval complete:', approved, pendingType, origin)
+
       } catch (e) {
-        console.error('Approval error:', e)
-        await storage.set(`cs_resp_${requestId}`, { result: null, error: { code: -32603, message: 'Internal error' }, ts: Date.now() })
+        console.error('[CyberSwitch] Approval error:', e)
+        if (origin) {
+          await resolveAllPendingReqs(origin, null, {
+            code: -32603, message: 'Internal error'
+          })
+        }
       }
     }
+
     handle().then(() => { try { sendResponse({ ok: true }) } catch {} })
     return true
   }
 
   if (type === 'CYBERSWITCH_PROVIDER_REQUEST') {
     const origin = (() => {
-      try { return sender?.origin || (sender?.tab?.url ? new URL(sender.tab.url).origin : 'unknown') }
-      catch { return 'unknown' }
+      try {
+        return sender?.origin ||
+          (sender?.tab?.url ? new URL(sender.tab.url).origin : 'unknown')
+      } catch { return 'unknown' }
     })()
+
     const req = { ...payload }
     handleProviderRequest(req, origin)
       .then(async result => {
         try {
-          if (result !== 'PENDING') await storage.set(`cs_resp_${req.requestId}`, { result, error: null, ts: Date.now() })
+          if (result !== 'PENDING') {
+            await storage.set(`cs_resp_${req.requestId}`, {
+              result, error: null, ts: Date.now()
+            })
+          }
           sendResponse({ ok: true })
         } catch {}
       })
       .catch(async error => {
         try {
-          await storage.set(`cs_resp_${req.requestId}`, { result: null, error: { code: error.code || -32603, message: error.message || 'Unknown error' }, ts: Date.now() })
+          if (req.method === 'eth_requestAccounts' && origin) {
+            await resolveAllPendingReqs(origin, null, {
+              code: error.code || -32603,
+              message: error.message || 'Unknown error'
+            })
+          } else {
+            await storage.set(`cs_resp_${req.requestId}`, {
+              result: null,
+              error: { code: error.code || -32603, message: error.message || 'Unknown error' },
+              ts: Date.now()
+            })
+          }
           sendResponse({ ok: true })
         } catch {}
       })

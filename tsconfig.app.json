@@ -1,4 +1,4 @@
-﻿{
+{
   "compilerOptions": {
     "types": ["chrome"],
     "target": "ES2020",
