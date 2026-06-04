@@ -6,6 +6,21 @@ const ARC_RPC = 'https://rpc.testnet.arc.network'
 
 console.log('[CyberSwitch Background Started]', new Date().toISOString())
 
+// ── Clear ALL transient request state on startup ──
+// This is the key fix — stale cs_* keys from previous sessions
+// cause "duplicate queued" and block new connections entirely.
+// Wallet data uses cyberswitch_* prefix and is NOT affected.
+chrome.storage.local.get(null, (res: any) => {
+  const transientKeys = Object.keys(res).filter(k =>
+    k.startsWith('cs_')
+  )
+  if (transientKeys.length > 0) {
+    chrome.storage.local.remove(transientKeys)
+    console.log('[CyberSwitch] Cleared', transientKeys.length, 'stale transient keys on startup')
+  }
+})
+
+// ── Keep alive via alarms ─────────────────────
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'keepAlive') chrome.runtime.getPlatformInfo(() => {})
@@ -15,6 +30,7 @@ chrome.runtime.onSuspend.addListener(() => {
   console.log('[CyberSwitch] Worker suspending')
 })
 
+// ── Storage helpers ───────────────────────────
 const storage = {
   get: (key: string): Promise<any> =>
     new Promise(r => {
@@ -33,11 +49,10 @@ const storage = {
     }),
 }
 
-// ── Encode origin for use as storage key ──────
+// ── Pending request tracking ──────────────────
 const encodeOrigin = (origin: string) =>
   origin.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60)
 
-// ── Pending request tracking (storage-based) ──
 const getPendingReqsKey = (origin: string) =>
   `cs_pending_reqs_${encodeOrigin(origin)}`
 
@@ -49,38 +64,35 @@ const addPendingReqId = async (origin: string, requestId: string): Promise<void>
   }
 }
 
-const getPendingReqIds = async (origin: string): Promise<string[]> => {
-  return (await storage.get(getPendingReqsKey(origin))) || []
-}
+const getPendingReqIds = async (origin: string): Promise<string[]> =>
+  (await storage.get(getPendingReqsKey(origin))) || []
 
-const clearPendingReqIds = async (origin: string): Promise<void> => {
-  await storage.remove(getPendingReqsKey(origin))
-}
+const clearPendingReqIds = async (origin: string): Promise<void> =>
+  storage.remove(getPendingReqsKey(origin))
 
 const isOriginPending = async (origin: string): Promise<boolean> => {
   const reqs = await getPendingReqIds(origin)
   return reqs.length > 0
 }
 
-// ── Just-approved cache — survives race conditions ──
-const getJustApprovedKey = (origin: string) =>
-  `cs_just_approved_${encodeOrigin(origin)}`
-
-const markJustApproved = async (origin: string, address: string): Promise<void> => {
-  await storage.set(getJustApprovedKey(origin), {
-    address,
-    ts: Date.now()
-  })
-}
-
-const getJustApproved = async (origin: string): Promise<string | null> => {
-  const val = await storage.get(getJustApprovedKey(origin))
-  if (!val || (Date.now() - val.ts) > 60000) return null // 60 second window
-  return val.address
-}
-
-const clearJustApproved = async (origin: string): Promise<void> => {
-  await storage.remove(getJustApprovedKey(origin))
+// ── Resolve ALL pending requests for an origin ─
+const resolveAllPendingReqs = async (
+  origin: string,
+  result: any,
+  error: any = null
+): Promise<void> => {
+  const reqIds = await getPendingReqIds(origin)
+  console.log('[CyberSwitch] Resolving', reqIds.length, 'pending requests for', origin)
+  await Promise.all(
+    reqIds.map(reqId =>
+      storage.set(`cs_resp_${reqId}`, {
+        result: error ? null : result,
+        error,
+        ts: Date.now()
+      })
+    )
+  )
+  await clearPendingReqIds(origin)
 }
 
 // ── Wallet helpers ────────────────────────────
@@ -103,9 +115,7 @@ const getConnectedSites = async (): Promise<string[]> => {
 const addConnectedSite = async (origin: string) => {
   try {
     const sites = await getConnectedSites()
-    if (!sites.includes(origin)) {
-      await storage.set(CONNECTED_SITES_KEY, [...sites, origin])
-    }
+    if (!sites.includes(origin)) await storage.set(CONNECTED_SITES_KEY, [...sites, origin])
   } catch {}
 }
 
@@ -114,26 +124,6 @@ const removeConnectedSite = async (origin: string) => {
     const sites = await getConnectedSites()
     await storage.set(CONNECTED_SITES_KEY, sites.filter((s: string) => s !== origin))
   } catch {}
-}
-
-// ── Resolve ALL pending requests for an origin ─
-const resolveAllPendingReqs = async (
-  origin: string,
-  result: any,
-  error: any = null
-): Promise<void> => {
-  const reqIds = await getPendingReqIds(origin)
-  console.log('[CyberSwitch] Resolving', reqIds.length, 'pending requests for', origin)
-  await Promise.all(
-    reqIds.map(reqId =>
-      storage.set(`cs_resp_${reqId}`, {
-        result: error ? null : result,
-        error,
-        ts: Date.now()
-      })
-    )
-  )
-  await clearPendingReqIds(origin)
 }
 
 const rpcCall = async (method: string, params: any[] = []) => {
@@ -157,6 +147,7 @@ const openPopup = async () => {
   }
 }
 
+// ── Clean up stale response keys every 5 min ──
 setInterval(() => {
   chrome.storage.local.get(null, (res: any) => {
     const stale = Object.keys(res).filter(k =>
@@ -176,18 +167,13 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
 
     case 'eth_accounts': {
       const sites = await getConnectedSites()
-      if (!sites.includes(origin)) {
-        // Also check just-approved cache
-        const justApprovedAddr = await getJustApproved(origin)
-        if (justApprovedAddr) return [justApprovedAddr]
-        return []
-      }
+      if (!sites.includes(origin)) return []
       const wallet = await getActiveWallet()
       return wallet ? [wallet.address] : []
     }
 
     case 'eth_requestAccounts': {
-      // Check connected sites
+      // Already connected — return immediately
       const sites = await getConnectedSites()
       if (sites.includes(origin)) {
         const wallet = await getActiveWallet()
@@ -195,16 +181,7 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
         return wallet ? [wallet.address] : []
       }
 
-      // Check just-approved cache (handles race condition)
-      const justApprovedAddr = await getJustApproved(origin)
-      if (justApprovedAddr) {
-        console.log('[CyberSwitch] Just approved (fast path):', origin)
-        return [justApprovedAddr]
-      }
-
       const alreadyPending = await isOriginPending(origin)
-
-      // Always register this requestId so it gets resolved on approval
       await addPendingReqId(origin, requestId)
 
       if (alreadyPending) {
@@ -212,7 +189,7 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
         return 'PENDING'
       }
 
-      // First request — write pending and open popup
+      // First request for this origin — open popup
       await storage.set('cs_pending', {
         type: 'connect',
         data: { origin },
@@ -270,7 +247,6 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
     case 'wallet_disconnect':
       await removeConnectedSite(origin)
       await clearPendingReqIds(origin)
-      await clearJustApproved(origin)
       return null
 
     default:
@@ -278,11 +254,12 @@ const handleProviderRequest = async (request: any, origin: string): Promise<any>
   }
 }
 
+// ── Main message listener ─────────────────────
 chrome.runtime.onMessage.addListener((message: any, sender: any, sendResponse: any) => {
   const { type, payload } = message
 
   if (type === 'CYBERSWITCH_APPROVAL_RESPONSE') {
-    const { approved, origin, pendingType, result } = payload
+    const { approved, origin, pendingType, requestId, result } = payload
 
     const handle = async () => {
       try {
@@ -290,15 +267,10 @@ chrome.runtime.onMessage.addListener((message: any, sender: any, sendResponse: a
           await addConnectedSite(origin)
           const wallet = await getActiveWallet()
           const addresses = wallet ? [wallet.address] : []
-
-          // Write just-approved cache immediately
-          if (wallet?.address) await markJustApproved(origin, wallet.address)
-
-          // Resolve all queued requests for this origin
+          // Resolve ALL queued requests for this origin
           await resolveAllPendingReqs(origin, addresses)
 
         } else if (approved) {
-          const { requestId } = payload
           await storage.set(`cs_resp_${requestId}`, {
             result: result ?? null, error: null, ts: Date.now()
           })
@@ -308,7 +280,6 @@ chrome.runtime.onMessage.addListener((message: any, sender: any, sendResponse: a
               code: 4001, message: 'User rejected the request'
             })
           } else {
-            const { requestId } = payload
             await storage.set(`cs_resp_${requestId}`, {
               result: null,
               error: { code: 4001, message: 'User rejected the request' },
