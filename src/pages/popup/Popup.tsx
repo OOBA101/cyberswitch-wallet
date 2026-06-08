@@ -72,13 +72,28 @@ export default function Popup() {
   const [signToConnectPending, setSignToConnectPending] = useState<any>(null)
   const [signLoading, setSignLoading] = useState(false)
 
-  // ── Key refs — survive re-renders, no stale closure ──
-  // True while user is actively in any approval screen
   const isHandlingApproval = useRef(false)
-  // Track which requestIds we've already shown
   const shownRequestIds = useRef(new Set<string>())
 
   const wallet = wallets[activeIndex] || null
+
+  // ── FIX 1: Separate data loading from navigation ──
+  // This is the KEY fix — refreshDashboard used to call setScreen('dashboard')
+  // which raced with and overrode setScreen('approveConnect') from the approval checker.
+  // Now: fetchWalletData loads data only. refreshDashboard loads data + navigates.
+  // Init uses fetchWalletData so it doesn't override approval screens.
+  const fetchWalletData = (address: string) => {
+    getUSDCBalance(address).then(b => {
+      setBalance(b)
+      setBalances(prev => ({ ...prev, [address]: b }))
+    })
+    getTransactions(address).then(setTransactions)
+  }
+
+  const refreshDashboard = (address: string) => {
+    fetchWalletData(address)
+    setScreen('dashboard')
+  }
 
   // ── Init ──────────────────────────────────────
   useEffect(() => {
@@ -97,8 +112,36 @@ export default function Popup() {
         ws.forEach(w => getUSDCBalance(w.address).then(b =>
           setBalances(prev => ({ ...prev, [w.address]: b }))
         ))
-        if (hasPwd) setScreen('locked')
-        else refreshDashboard(ws[safeIdx].address)
+
+        // FIX 2: Load wallet data WITHOUT navigating
+        // This prevents init from overriding the approval screen
+        fetchWalletData(ws[safeIdx].address)
+
+        // FIX 3: Check if approval is already being handled
+        if (isHandlingApproval.current) {
+          console.log('[Init] Approval in progress — skipping navigation')
+          return
+        }
+
+        // FIX 4: Also check storage directly in case approval checker
+        // hasn't fired yet (it's async too)
+        const hasPendingApproval = await new Promise<boolean>(resolve => {
+          if (!ch?.storage?.local) { resolve(false); return }
+          ch.storage.local.get(['cs_pending'], (res: any) => {
+            const p = res['cs_pending']
+            resolve(!!(p && Date.now() - p.ts < 120000))
+          })
+        })
+
+        if (hasPendingApproval) {
+          console.log('[Init] Pending approval in storage — deferring screen to approval handler')
+          return // Let the approval checker set the screen
+        }
+
+        // No pending approval — navigate normally
+        if (hasPwd) { setScreen('locked') }
+        else { setScreen('dashboard') }
+
       } catch (e) {
         console.error('Init error:', e)
         setScreen('welcome')
@@ -129,20 +172,17 @@ export default function Popup() {
     const ch = (globalThis as any).chrome
     if (!ch?.storage?.local) return
 
-    // Core function — only shows approval if not already handling one
     const handlePendingIfNew = (pending: any) => {
       if (!pending) return
-      if (Date.now() - pending.ts > 120000) return // Expired
-      if (isHandlingApproval.current) return // Already handling — do NOT interrupt
-      if (shownRequestIds.current.has(pending.requestId)) return // Already shown this one
+      if (Date.now() - pending.ts > 120000) return
+      if (isHandlingApproval.current) return
+      if (shownRequestIds.current.has(pending.requestId)) return
 
-      // For connect: check if site is already connected before showing
       if (pending.type === 'connect' && pending.data?.origin) {
         ch.storage.local.get(['cyberswitch_connected_sites'], (res: any) => {
           const sites: string[] = res['cyberswitch_connected_sites'] || []
-          if (sites.includes(pending.data.origin)) return // Already connected, skip
+          if (sites.includes(pending.data.origin)) return
 
-          // New connect request — show it
           isHandlingApproval.current = true
           shownRequestIds.current.add(pending.requestId)
           setPendingRequest(pending)
@@ -151,7 +191,6 @@ export default function Popup() {
         return
       }
 
-      // Transaction or sign
       isHandlingApproval.current = true
       shownRequestIds.current.add(pending.requestId)
       setPendingRequest(pending)
@@ -159,26 +198,23 @@ export default function Popup() {
       if (pending.type === 'sign') setScreen('approveSign')
     }
 
-    // Initial check
     ch.storage.local.get(['cs_pending'], (res: any) => {
       handlePendingIfNew(res['cs_pending'])
     })
 
-    // Slow poll — only needed as fallback (10s interval, max 6 times = 1 minute)
     let attempts = 0
     const interval = setInterval(() => {
       attempts++
       if (attempts >= 6) { clearInterval(interval); return }
-      if (isHandlingApproval.current) return // Stop polling once handling
+      if (isHandlingApproval.current) return
       ch.storage.local.get(['cs_pending'], (res: any) => {
         handlePendingIfNew(res['cs_pending'])
       })
     }, 10000)
 
-    // Storage change listener — the key fix is checking isHandlingApproval.current
     const listener = (changes: any) => {
       if (!changes['cs_pending']?.newValue) return
-      if (isHandlingApproval.current) return // DO NOT interrupt current flow
+      if (isHandlingApproval.current) return
       handlePendingIfNew(changes['cs_pending'].newValue)
     }
 
@@ -189,15 +225,6 @@ export default function Popup() {
       try { ch.storage.onChanged?.removeListener(listener) } catch {}
     }
   }, [])
-
-  const refreshDashboard = (address: string) => {
-    getUSDCBalance(address).then(b => {
-      setBalance(b)
-      setBalances(prev => ({ ...prev, [address]: b }))
-    })
-    getTransactions(address).then(setTransactions)
-    setScreen('dashboard')
-  }
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text)
@@ -222,7 +249,7 @@ export default function Popup() {
     const pendingType = pendingRequest.type
     const storageKey = `cs_resp_${requestId}`
 
-    // Release the lock FIRST so storage listener doesn't re-trigger
+    // Release lock BEFORE writing to storage
     isHandlingApproval.current = false
 
     try {
@@ -241,6 +268,7 @@ export default function Popup() {
             })
           })
         })
+        console.log('[Popup] Wallet at approval:', wallet?.address)
         const addresses = wallet?.address ? [wallet.address] : []
         responsePayload = { result: addresses, error: null, ts: Date.now() }
 
@@ -264,7 +292,6 @@ export default function Popup() {
       await new Promise(res => setTimeout(res, 300))
       await new Promise<void>(res => ch.storage.local.remove(['cs_pending'], res))
 
-      // Notify background to clear pendingOrigins and resolve duplicates
       try {
         ch.runtime.sendMessage({
           type: 'CYBERSWITCH_APPROVAL_RESPONSE',
@@ -841,7 +868,6 @@ export default function Popup() {
         </div>
         <p style={s.bodyText}>This site is requesting access to your wallet address. It cannot move funds without explicit approval.</p>
         <button style={s.btnPrimary} onClick={() => {
-          // isHandlingApproval stays true — we're moving within the flow
           setSignToConnectPending(pendingRequest)
           setScreen('signToConnect')
         }}>Review & Sign →</button>
@@ -904,12 +930,8 @@ export default function Popup() {
             {signLoading ? 'Signing...' : '✍️ Sign & Connect'}
           </button>
           <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
-            onClick={() => {
-              sendApprovalResponse(false)
-              setSignToConnectPending(null)
-            }}>Reject</button>
+            onClick={() => { sendApprovalResponse(false); setSignToConnectPending(null) }}>Reject</button>
           <button style={s.btnGhost} onClick={() => {
-            // Going back — stay in approval flow
             setSignToConnectPending(null)
             setScreen('approveConnect')
           }}>← Back</button>
