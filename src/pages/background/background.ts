@@ -6,17 +6,16 @@ const ARC_RPC = 'https://rpc.testnet.arc.network'
 
 console.log('[CyberSwitch Background Started]', new Date().toISOString())
 
-// ── Clear ALL transient request state on startup ──
-// This is the key fix — stale cs_* keys from previous sessions
-// cause "duplicate queued" and block new connections entirely.
-// Wallet data uses cyberswitch_* prefix and is NOT affected.
+// ── Clear ONLY request tracking keys on startup ──
+// cs_pending_reqs_* cause "duplicate queued" when stale
+// DO NOT clear cs_pending (active request) or cs_resp_* (response keys)
 chrome.storage.local.get(null, (res: any) => {
-  const transientKeys = Object.keys(res).filter(k =>
-    k.startsWith('cs_')
+  const staleTrackingKeys = Object.keys(res).filter(k =>
+    k.startsWith('cs_pending_reqs_')
   )
-  if (transientKeys.length > 0) {
-    chrome.storage.local.remove(transientKeys)
-    console.log('[CyberSwitch] Cleared', transientKeys.length, 'stale transient keys on startup')
+  if (staleTrackingKeys.length > 0) {
+    chrome.storage.local.remove(staleTrackingKeys)
+    console.log('[CyberSwitch] Cleared', staleTrackingKeys.length, 'stale tracking keys on startup')
   }
 })
 
