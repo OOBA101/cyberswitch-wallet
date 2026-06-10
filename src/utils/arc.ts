@@ -106,33 +106,63 @@ export const getTransactions = async (address: string): Promise<any[]> => {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
 
-    const response = await fetch(
-      `${ARC_EXPLORER_API}/addresses/${address}/transactions`,
-      {
-        signal: controller.signal,
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        mode: 'cors',
-      }
-    )
+    const fetchOpts = {
+      signal: controller.signal,
+      headers: { 'Accept': 'application/json' },
+    }
+
+    // Fetch both sent (from) and received (to) transactions separately
+    // then merge — some ArcScan deployments only return outgoing by default
+    const [sentRes, receivedRes] = await Promise.allSettled([
+      fetch(`${ARC_EXPLORER_API}/addresses/${address}/transactions?filter=from`, fetchOpts),
+      fetch(`${ARC_EXPLORER_API}/addresses/${address}/transactions?filter=to`, fetchOpts),
+    ])
 
     clearTimeout(timeout)
 
-    if (!response.ok) {
-      console.error("TX fetch error:", response.status)
-      return []
+    const allItems: any[] = []
+    const seenHashes = new Set<string>()
+
+    for (const res of [sentRes, receivedRes]) {
+      if (res.status === 'fulfilled' && res.value.ok) {
+        const data = await res.value.json()
+        const items = data?.items || []
+        for (const tx of items) {
+          const hash = tx.hash || tx.tx_hash
+          if (hash && !seenHashes.has(hash)) {
+            seenHashes.add(hash)
+            allItems.push(tx)
+          }
+        }
+      }
     }
 
-    const data = await response.json()
-    return data?.items || []
+    // If filter params not supported, fall back to unfiltered
+    if (allItems.length === 0) {
+      const fallback = await fetch(
+        `${ARC_EXPLORER_API}/addresses/${address}/transactions`,
+        { headers: { 'Accept': 'application/json' } }
+      )
+      if (fallback.ok) {
+        const data = await fallback.json()
+        return data?.items || []
+      }
+    }
+
+    // Sort by timestamp descending (most recent first)
+    allItems.sort((a, b) => {
+      const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0
+      const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0
+      return tb - ta
+    })
+
+    return allItems
+
   } catch (error: any) {
-    // CORS or network error — fail silently, don't crash the app
     if (error?.name === 'AbortError') {
-      console.warn("TX fetch timed out")
+      console.warn('TX fetch timed out')
     } else {
-      console.warn("TX fetch unavailable:", error?.message)
+      console.warn('TX fetch unavailable:', error?.message)
     }
     return []
   }

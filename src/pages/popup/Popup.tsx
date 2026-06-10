@@ -44,6 +44,44 @@ const WatermarkBg = () => (
   </div>
 )
 
+// Reusable eye-toggle password input
+const PasswordInput = ({
+  value, onChange, placeholder = 'Enter password', onKeyDown
+}: {
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void
+}) => {
+  const [show, setShow] = useState(false)
+  return (
+    <div style={{ position: 'relative' }}>
+      <input
+        style={{
+          background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)',
+          borderRadius: 10, padding: '12px 44px 12px 14px', color: '#fff', fontSize: 14,
+          outline: 'none', fontFamily: 'inherit', width: '100%', boxSizing: 'border-box' as const
+        }}
+        type={show ? 'text' : 'password'}
+        placeholder={placeholder}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={onKeyDown}
+      />
+      <button
+        type="button"
+        onClick={() => setShow(p => !p)}
+        style={{
+          position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)',
+          background: 'none', border: 'none', cursor: 'pointer', color: '#7b8cde',
+          fontSize: 16, padding: 4, lineHeight: 1
+        }}>
+        {show ? '🙈' : '👁'}
+      </button>
+    </div>
+  )
+}
+
 export default function Popup() {
   const [screen, setScreen] = useState<Screen>('loading')
   const [wallets, setWallets] = useState<WalletData[]>([])
@@ -77,11 +115,6 @@ export default function Popup() {
 
   const wallet = wallets[activeIndex] || null
 
-  // ── FIX 1: Separate data loading from navigation ──
-  // This is the KEY fix — refreshDashboard used to call setScreen('dashboard')
-  // which raced with and overrode setScreen('approveConnect') from the approval checker.
-  // Now: fetchWalletData loads data only. refreshDashboard loads data + navigates.
-  // Init uses fetchWalletData so it doesn't override approval screens.
   const fetchWalletData = (address: string) => {
     getUSDCBalance(address).then(b => {
       setBalance(b)
@@ -113,18 +146,13 @@ export default function Popup() {
           setBalances(prev => ({ ...prev, [w.address]: b }))
         ))
 
-        // FIX 2: Load wallet data WITHOUT navigating
-        // This prevents init from overriding the approval screen
         fetchWalletData(ws[safeIdx].address)
 
-        // FIX 3: Check if approval is already being handled
         if (isHandlingApproval.current) {
           console.log('[Init] Approval in progress — skipping navigation')
           return
         }
 
-        // FIX 4: Also check storage directly in case approval checker
-        // hasn't fired yet (it's async too)
         const hasPendingApproval = await new Promise<boolean>(resolve => {
           if (!ch?.storage?.local) { resolve(false); return }
           ch.storage.local.get(['cs_pending'], (res: any) => {
@@ -134,11 +162,10 @@ export default function Popup() {
         })
 
         if (hasPendingApproval) {
-          console.log('[Init] Pending approval in storage — deferring screen to approval handler')
-          return // Let the approval checker set the screen
+          console.log('[Init] Pending approval — deferring to approval handler')
+          return
         }
 
-        // No pending approval — navigate normally
         if (hasPwd) { setScreen('locked') }
         else { setScreen('dashboard') }
 
@@ -150,7 +177,7 @@ export default function Popup() {
     init()
   }, [])
 
-  // ── Check current tab connection ──────────────
+  // ── Current tab connection status ─────────────
   useEffect(() => {
     const ch = (globalThis as any).chrome
     if (!ch?.tabs || !ch?.storage?.local) return
@@ -219,7 +246,6 @@ export default function Popup() {
     }
 
     ch.storage.onChanged?.addListener(listener)
-
     return () => {
       clearInterval(interval)
       try { ch.storage.onChanged?.removeListener(listener) } catch {}
@@ -249,7 +275,6 @@ export default function Popup() {
     const pendingType = pendingRequest.type
     const storageKey = `cs_resp_${requestId}`
 
-    // Release lock BEFORE writing to storage
     isHandlingApproval.current = false
 
     try {
@@ -268,7 +293,6 @@ export default function Popup() {
             })
           })
         })
-        console.log('[Popup] Wallet at approval:', wallet?.address)
         const addresses = wallet?.address ? [wallet.address] : []
         responsePayload = { result: addresses, error: null, ts: Date.now() }
 
@@ -370,8 +394,10 @@ export default function Popup() {
         <p style={{ ...s.bodyText, textAlign: 'center' }}>Enter your password to unlock</p>
         <div style={s.inputGroup}>
           <label style={s.label}>Password</label>
-          <input style={s.input} type="password" placeholder="Enter password"
-            value={passwordInput} onChange={e => setPasswordInput(e.target.value)}
+          <PasswordInput
+            value={passwordInput}
+            onChange={setPasswordInput}
+            placeholder="Enter password"
             onKeyDown={async e => {
               if (e.key !== 'Enter') return
               const ok = await verifyPassword(passwordInput)
@@ -380,7 +406,8 @@ export default function Popup() {
                 const ws = await loadWallets(); setWallets(ws)
                 refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
               } else setError('Incorrect password')
-            }} />
+            }}
+          />
         </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={async () => {
@@ -407,13 +434,11 @@ export default function Popup() {
         <p style={s.bodyText}>Protect your wallet with a password. Required every time you open CyberSwitch.</p>
         <div style={s.inputGroup}>
           <label style={s.label}>New Password</label>
-          <input style={s.input} type="password" placeholder="Min 6 characters"
-            value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
+          <PasswordInput value={passwordInput} onChange={setPasswordInput} placeholder="Min 6 characters" />
         </div>
         <div style={s.inputGroup}>
           <label style={s.label}>Confirm Password</label>
-          <input style={s.input} type="password" placeholder="Repeat password"
-            value={passwordConfirm} onChange={e => setPasswordConfirm(e.target.value)} />
+          <PasswordInput value={passwordConfirm} onChange={setPasswordConfirm} placeholder="Repeat password" />
         </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={async () => {
@@ -439,12 +464,11 @@ export default function Popup() {
         </div>
         <div style={s.inputGroup}>
           <label style={s.label}>Current Password</label>
-          <input style={s.input} type="password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} />
+          <PasswordInput value={passwordInput} onChange={setPasswordInput} placeholder="Current password" />
         </div>
         <div style={s.inputGroup}>
           <label style={s.label}>New Password</label>
-          <input style={s.input} type="password" placeholder="Min 6 characters"
-            value={passwordConfirm} onChange={e => setPasswordConfirm(e.target.value)} />
+          <PasswordInput value={passwordConfirm} onChange={setPasswordConfirm} placeholder="Min 6 characters" />
         </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.btnPrimary} onClick={async () => {
@@ -658,6 +682,9 @@ export default function Popup() {
                 setSendAddress(''); setSendAmount(''); setConfirming(false)
                 refreshDashboard(wallet!.address)
                 showSuccess(`✓ ${amt} USDC sent!`)
+                const addr = wallet!.address
+                setTimeout(() => fetchWalletData(addr), 5000)
+                setTimeout(() => fetchWalletData(addr), 12000)
               } else { setError(result.error || 'Transaction failed'); setConfirming(false) }
             }}>Confirm & Send</button>
             <button style={s.btnGhost} onClick={() => setConfirming(false)}>← Cancel</button>
@@ -882,7 +909,6 @@ export default function Popup() {
     const currentPending = signToConnectPending || pendingRequest
     const origin = currentPending?.data?.origin || ''
     const signMessage = `CyberSwitch Wallet Authentication\n\nSite: ${origin}\nWallet: ${wallet?.address}\nTimestamp: ${new Date().toISOString()}\n\nBy signing this message you authorize CyberSwitch to connect your wallet to this site. This does not grant permission to move funds.`
-
     return (
       <div style={s.page}>
         <WatermarkBg />
@@ -931,10 +957,7 @@ export default function Popup() {
           </button>
           <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
             onClick={() => { sendApprovalResponse(false); setSignToConnectPending(null) }}>Reject</button>
-          <button style={s.btnGhost} onClick={() => {
-            setSignToConnectPending(null)
-            setScreen('approveConnect')
-          }}>← Back</button>
+          <button style={s.btnGhost} onClick={() => { setSignToConnectPending(null); setScreen('approveConnect') }}>← Back</button>
         </div>
       </div>
     )
