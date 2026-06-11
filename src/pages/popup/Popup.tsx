@@ -44,7 +44,7 @@ const WatermarkBg = () => (
   </div>
 )
 
-// Reusable eye-toggle password input
+// Reusable password input with show/hide toggle
 const PasswordInput = ({
   value, onChange, placeholder = 'Enter password', onKeyDown
 }: {
@@ -128,16 +128,43 @@ export default function Popup() {
     setScreen('dashboard')
   }
 
-  // ── Init ──────────────────────────────────────
+  // ── Helper: fully load wallets and navigate to dashboard ──
+  const loadAndNavigate = async (idx?: number) => {
+    const ws = await loadWallets()
+    if (ws.length === 0) { setScreen('welcome'); return }
+    setWallets(ws)
+    const safeIdx = Math.min(idx ?? activeIndex, ws.length - 1)
+    setActiveIndex(safeIdx)
+    ws.forEach(w => getUSDCBalance(w.address).then(b =>
+      setBalances(prev => ({ ...prev, [w.address]: b }))
+    ))
+    refreshDashboard(ws[safeIdx].address)
+  }
+
+  // ── Init ─────────────────────────────────────────────────
+  // KEY FIX: Check password FIRST.
+  // If password is set, show locked screen WITHOUT loading wallets.
+  // loadWallets() is only called after verifyPassword() sets _cachedKey.
   useEffect(() => {
     const ch = (globalThis as any).chrome
     if (ch?.action) ch.action.setBadgeText({ text: '' })
 
     const init = async () => {
       try {
-        const [ws, idx, hasPwd] = await Promise.all([
-          loadWallets(), loadActiveIndex(), hasPassword(),
+        const [idx, hasPwd] = await Promise.all([
+          loadActiveIndex(), hasPassword(),
         ])
+
+        if (hasPwd) {
+          // Password is set — show lock screen, do NOT call loadWallets() yet.
+          // loadWallets() needs _cachedKey which only gets set in verifyPassword().
+          setActiveIndex(idx)
+          setScreen('locked')
+          return
+        }
+
+        // No password — safe to load wallets now
+        const ws = await loadWallets()
         if (ws.length === 0) { setScreen('welcome'); return }
         setWallets(ws)
         const safeIdx = Math.min(idx, ws.length - 1)
@@ -148,10 +175,7 @@ export default function Popup() {
 
         fetchWalletData(ws[safeIdx].address)
 
-        if (isHandlingApproval.current) {
-          console.log('[Init] Approval in progress — skipping navigation')
-          return
-        }
+        if (isHandlingApproval.current) return
 
         const hasPendingApproval = await new Promise<boolean>(resolve => {
           if (!ch?.storage?.local) { resolve(false); return }
@@ -161,13 +185,9 @@ export default function Popup() {
           })
         })
 
-        if (hasPendingApproval) {
-          console.log('[Init] Pending approval — deferring to approval handler')
-          return
-        }
+        if (hasPendingApproval) return
 
-        if (hasPwd) { setScreen('locked') }
-        else { setScreen('dashboard') }
+        setScreen('dashboard')
 
       } catch (e) {
         console.error('Init error:', e)
@@ -177,7 +197,7 @@ export default function Popup() {
     init()
   }, [])
 
-  // ── Current tab connection status ─────────────
+  // ── Current tab connection ────────────────────
   useEffect(() => {
     const ch = (globalThis as any).chrome
     if (!ch?.tabs || !ch?.storage?.local) return
@@ -295,15 +315,10 @@ export default function Popup() {
         })
         const addresses = wallet?.address ? [wallet.address] : []
         responsePayload = { result: addresses, error: null, ts: Date.now() }
-
       } else if (approved) {
         responsePayload = { result: result ?? null, error: null, ts: Date.now() }
       } else {
-        responsePayload = {
-          result: null,
-          error: { code: 4001, message: 'User rejected the request' },
-          ts: Date.now()
-        }
+        responsePayload = { result: null, error: { code: 4001, message: 'User rejected the request' }, ts: Date.now() }
       }
 
       await new Promise<void>((res, rej) => {
@@ -382,7 +397,8 @@ export default function Popup() {
     }
   }
 
-  // ── Lock ──────────────────────────────────────
+  // ── Lock screen ──────────────────────────────
+  // KEY FIX: After verifyPassword() sets _cachedKey, THEN load wallets.
   if (screen === 'locked') return (
     <div style={s.page}>
       <WatermarkBg />
@@ -403,8 +419,7 @@ export default function Popup() {
               const ok = await verifyPassword(passwordInput)
               if (ok) {
                 setPasswordInput(''); setError('')
-                const ws = await loadWallets(); setWallets(ws)
-                refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
+                await loadAndNavigate(activeIndex)
               } else setError('Incorrect password')
             }}
           />
@@ -414,8 +429,7 @@ export default function Popup() {
           const ok = await verifyPassword(passwordInput)
           if (ok) {
             setPasswordInput(''); setError('')
-            const ws = await loadWallets(); setWallets(ws)
-            refreshDashboard(ws[activeIndex]?.address || ws[0]?.address)
+            await loadAndNavigate(activeIndex)
           } else setError('Incorrect password')
         }}>Unlock</button>
       </div>
@@ -894,10 +908,7 @@ export default function Popup() {
           ))}
         </div>
         <p style={s.bodyText}>This site is requesting access to your wallet address. It cannot move funds without explicit approval.</p>
-        <button style={s.btnPrimary} onClick={() => {
-          setSignToConnectPending(pendingRequest)
-          setScreen('signToConnect')
-        }}>Review & Sign →</button>
+        <button style={s.btnPrimary} onClick={() => { setSignToConnectPending(pendingRequest); setScreen('signToConnect') }}>Review & Sign →</button>
         <button style={{ ...s.btnPrimary, background: 'linear-gradient(135deg, #dc2626, #b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}
           onClick={() => sendApprovalResponse(false)}>Reject</button>
       </div>
@@ -1096,7 +1107,6 @@ export default function Popup() {
           </div>
         </div>
 
-        {/* Connection status bar */}
         <div style={s.connectionBar} onClick={() => { loadConnectedSites(); setScreen('connectedSites') }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <div style={{
